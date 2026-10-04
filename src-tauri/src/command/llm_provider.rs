@@ -1,0 +1,798 @@
+use crate::command::base::CommandResult;
+use crate::config::{LlmChainLink, LlmProviderPreset, PRIMARY_LLM_ENTRY_ID};
+use crate::credential::{self, CredentialStatus, EffectiveCredentialSource, ResolvedCredential};
+use crate::error::AppError;
+use crate::llm::service::{
+    http_client_for, normalize_provider_base_url, provider_requires_key, rig_http_client_for,
+    LlmService,
+};
+use crate::llm::types::ConnectionReport;
+use rig::client::ModelListingClient;
+use rig::model::{Model, ModelList, ModelListingError};
+use serde::Serialize;
+use std::time::Duration;
+use tokio::time::timeout;
+
+/// 批量查询降级链密钥状态时的单条结果。
+/// 比 `CredentialStatus` 多带一个 `entry_id`，让配置页可以直接按服务对号入座。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LlmEntryCredentialStatus {
+    pub entry_id: String,
+    pub configured: bool,
+    pub source: EffectiveCredentialSource,
+}
+
+/// 把内部 `Result` 收敛成命令层返回值，避免每个命令都重复 match
+fn to_command_result<T>(result: Result<T, AppError>) -> CommandResult<T> {
+    match result {
+        Ok(value) => CommandResult::ok(value),
+        Err(error) => CommandResult::err(error),
+    }
+}
+
+// ================================
+// 主用服务（沿用旧调用点）
+// ================================
+
+#[tauri::command]
+pub fn get_llm_credential_status() -> CommandResult<CredentialStatus> {
+    to_command_result(credential::status_for_entry(PRIMARY_LLM_ENTRY_ID))
+}
+
+#[tauri::command]
+pub fn set_llm_api_key(api_key: String) -> CommandResult<CredentialStatus> {
+    to_command_result(set_entry_api_key(PRIMARY_LLM_ENTRY_ID, &api_key))
+}
+
+#[tauri::command]
+pub fn clear_llm_api_key() -> CommandResult<CredentialStatus> {
+    to_command_result(clear_entry_api_key(PRIMARY_LLM_ENTRY_ID))
+}
+
+// ================================
+// 按服务标识操作降级链
+// ================================
+
+fn set_entry_api_key(entry_id: &str, api_key: &str) -> Result<CredentialStatus, AppError> {
+    credential::set_for_entry(entry_id, api_key)?;
+    credential::status_for_entry(entry_id)
+}
+
+fn clear_entry_api_key(entry_id: &str) -> Result<CredentialStatus, AppError> {
+    credential::delete_for_entry(entry_id)?;
+    credential::status_for_entry(entry_id)
+}
+
+/// 查询单个服务的密钥状态
+#[tauri::command]
+pub fn get_llm_credential_status_for(entry_id: String) -> CommandResult<CredentialStatus> {
+    to_command_result(credential::status_for_entry(&entry_id))
+}
+
+/// 保存单个服务的密钥，返回保存后的状态
+#[tauri::command]
+pub fn set_llm_api_key_for(entry_id: String, api_key: String) -> CommandResult<CredentialStatus> {
+    to_command_result(set_entry_api_key(&entry_id, &api_key))
+}
+
+/// 清除单个服务的密钥，返回清除后的状态
+#[tauri::command]
+pub fn clear_llm_api_key_for(entry_id: String) -> CommandResult<CredentialStatus> {
+    to_command_result(clear_entry_api_key(&entry_id))
+}
+
+/// 互换两个服务已保存的密钥，用于降级链上调整主用/备用顺序。
+///
+/// 密钥明文不允许离开 Rust，因此搬运必须在后端整体完成，
+/// 前端只负责发起并接收交换后的状态。
+#[tauri::command]
+pub fn swap_llm_credentials(
+    entry_a: String,
+    entry_b: String,
+) -> CommandResult<Vec<LlmEntryCredentialStatus>> {
+    let result = credential::swap_entries(&entry_a, &entry_b).and_then(|()| {
+        collect_entry_credential_status(
+            &[entry_a.clone(), entry_b.clone()],
+            credential::status_for_entry,
+        )
+    });
+    to_command_result(result)
+}
+
+/// 批量查询多个服务的密钥状态，供配置页列表一次性渲染。
+/// 返回结果与入参等长且顺序一致，前端可以直接按下标对齐。
+#[tauri::command]
+pub fn list_llm_credential_status(
+    entry_ids: Vec<String>,
+) -> CommandResult<Vec<LlmEntryCredentialStatus>> {
+    to_command_result(collect_entry_credential_status(
+        &entry_ids,
+        credential::status_for_entry,
+    ))
+}
+
+fn collect_entry_credential_status<F>(
+    entry_ids: &[String],
+    mut status_of: F,
+) -> Result<Vec<LlmEntryCredentialStatus>, AppError>
+where
+    F: FnMut(&str) -> Result<CredentialStatus, AppError>,
+{
+    entry_ids
+        .iter()
+        .map(|entry_id| {
+            let status = status_of(entry_id)?;
+            Ok(LlmEntryCredentialStatus {
+                entry_id: entry_id.clone(),
+                configured: status.configured,
+                source: status.source,
+            })
+        })
+        .collect()
+}
+
+/// 在降级链中按标识定位一个服务。
+/// 链只收录填写完整且处于启用状态的服务，所以「找不到」通常是缺服务地址或模型名，
+/// 其次才是该服务被停用了。
+fn find_chain_link<'a>(
+    chain: &'a [LlmChainLink],
+    entry_id: &str,
+) -> Result<&'a LlmChainLink, AppError> {
+    chain
+        .iter()
+        .find(|link| link.id == entry_id)
+        .ok_or_else(|| {
+            AppError::configuration("该大模型服务尚不可用，请补齐服务地址和模型名称并确认它已启用")
+        })
+}
+
+/// 用已保存的配置构建降级链中某个服务的实例
+/// 连接测试是全项目**唯一**不走 [`crate::agent`] 的模型调用，这是刻意的：
+/// 它要验证的是「这一个 provider 通不通」，而 Agent 循环带降级链——
+/// 主用服务连不上时会顶上备用服务并返回成功，等于把测试本身废掉。
+/// 探活也不是「任务」，没有提示词、没有结构化输出、不需要返工。
+fn entry_service(app_handle: tauri::AppHandle, entry_id: &str) -> Result<LlmService, AppError> {
+    let (link, credential) = resolve_chain_entry(app_handle, entry_id)?;
+    LlmService::from_chain_link(&link, &credential)
+}
+
+/// 读取已保存的配置，定位目标服务并取出它自己的密钥
+fn resolve_chain_entry(
+    app_handle: tauri::AppHandle,
+    entry_id: &str,
+) -> Result<(LlmChainLink, ResolvedCredential), AppError> {
+    let config = crate::config::load_app_config_inner(app_handle)?;
+    let chain = config.llm_chain();
+    let link = find_chain_link(&chain, entry_id)?.clone();
+    let credential = credential::resolve_for_entry(&link.id)?;
+    Ok((link, credential))
+}
+
+/// 用当前已保存的配置，测试降级链中某个服务的连通性
+#[tauri::command]
+pub async fn test_llm_entry_connection(
+    app_handle: tauri::AppHandle,
+    entry_id: String,
+) -> CommandResult<ConnectionReport> {
+    match entry_service(app_handle, &entry_id) {
+        Ok(service) => to_command_result(service.test_connection().await),
+        Err(error) => CommandResult::err(error),
+    }
+}
+
+/// 界面上正在编辑的服务参数。三项齐备才算数：只传一半无从判断该配哪个客户端，
+/// 与其猜一个，不如退回已落盘的配置。insecure 缺省时视为关闭。
+fn draft_override(
+    provider: Option<LlmProviderPreset>,
+    base_url: Option<String>,
+    insecure: Option<bool>,
+) -> Option<(LlmProviderPreset, String, bool)> {
+    let base_url = base_url.map(|url| url.trim().to_string())?;
+    if base_url.is_empty() {
+        return None;
+    }
+    Some((provider?, base_url, insecure.unwrap_or(false)))
+}
+
+/// 列出降级链中某个服务可用的模型。
+///
+/// `provider` / `base_url` 是界面上正在编辑的草稿，传了就以草稿为准。
+/// 备用服务的模型名为空时整份配置根本保存不了，若这里坚持只读已落盘的配置，
+/// 就成了「保存要模型、取模型要先保存」的死锁——新建的备用服务永远拿不到模型列表。
+/// 密钥始终按 `entry_id` 从凭据库读取，明文不经过前端。
+#[tauri::command]
+pub async fn list_llm_models_for(
+    app_handle: tauri::AppHandle,
+    entry_id: String,
+    provider: Option<LlmProviderPreset>,
+    base_url: Option<String>,
+    insecure: Option<bool>,
+) -> CommandResult<Vec<String>> {
+    let (provider, base_url, insecure, credential) = match draft_override(provider, base_url, insecure) {
+        Some((provider, base_url, insecure)) => match credential::resolve_for_entry(&entry_id) {
+            Ok(credential) => (provider, base_url, insecure, credential),
+            Err(error) => return CommandResult::err(error),
+        },
+        None => match resolve_chain_entry(app_handle, &entry_id) {
+            Ok((link, credential)) => (link.provider, link.base_url, link.insecure, credential),
+            Err(error) => return CommandResult::err(error),
+        },
+    };
+    to_command_result(fetch_model_list_with_credential(provider, &base_url, &credential, insecure).await)
+}
+
+fn validate_llm_base_url(base_url: &str) -> Result<(), AppError> {
+    let base_url = base_url.trim();
+    if base_url.is_empty() {
+        return Err(AppError::validation("大模型服务地址不能为空"));
+    }
+    let scheme_end = base_url
+        .find("://")
+        .ok_or_else(|| AppError::validation("大模型服务地址无效"))?;
+    let scheme = &base_url[..scheme_end];
+    if !matches!(scheme, "http" | "https") {
+        return Err(AppError::validation("大模型服务地址仅支持 HTTP 或 HTTPS"));
+    }
+    Ok(())
+}
+
+const MODEL_LIST_TIMEOUT_SECONDS: u64 = 30;
+
+async fn fetch_model_list(
+    provider: LlmProviderPreset,
+    base_url: &str,
+    insecure: bool,
+) -> Result<Vec<String>, AppError> {
+    let credential = credential::resolve_for_entry(PRIMARY_LLM_ENTRY_ID)?;
+    fetch_model_list_with_credential(provider, base_url, &credential, insecure).await
+}
+
+/// 用指定服务自己的密钥拉取模型列表。
+/// 降级链上每个服务的密钥独立存储，所以这里由调用方传入已解析的凭证。
+async fn fetch_model_list_with_credential(
+    provider: LlmProviderPreset,
+    base_url: &str,
+    credential: &ResolvedCredential,
+    insecure: bool,
+) -> Result<Vec<String>, AppError> {
+    validate_llm_base_url(base_url)?;
+    if provider_requires_key(&provider) && credential.secret().is_none() {
+        return Err(AppError::credential("请先配置该大模型服务的 API Key"));
+    }
+    let api_key = credential
+        .secret()
+        .unwrap_or(if matches!(provider, LlmProviderPreset::Ollama) {
+            ""
+        } else {
+            "noop"
+        });
+    let base_url = normalize_provider_base_url(&provider, base_url);
+    let http_client = rig_http_client_for(insecure)?;
+
+    let models = match provider {
+        LlmProviderPreset::Anthropic => {
+            let client = rig::providers::anthropic::Client::builder()
+                .api_key(api_key)
+                .base_url(&base_url)
+                .http_client(http_client.clone())
+                .build()
+                .map_err(|error| {
+                    AppError::configuration("无法创建大模型客户端").with_detail(error.to_string())
+                })?;
+            timeout(
+                Duration::from_secs(MODEL_LIST_TIMEOUT_SECONDS),
+                client.list_models(),
+            )
+            .await
+            .map_err(|_| AppError::network("获取模型列表超时"))?
+            .map_err(map_model_listing_error)?
+        }
+        LlmProviderPreset::DeepSeek => fetch_openai_compatible_models(&base_url, api_key, insecure).await?,
+        LlmProviderPreset::OpenAi | LlmProviderPreset::OpenAiResponses => {
+            let client = rig::providers::openai::Client::builder()
+                .api_key(api_key)
+                .base_url(&base_url)
+                .http_client(http_client.clone())
+                .build()
+                .map_err(|error| {
+                    AppError::configuration("无法创建大模型客户端").with_detail(error.to_string())
+                })?;
+            match timeout(
+                Duration::from_secs(MODEL_LIST_TIMEOUT_SECONDS),
+                client.list_models(),
+            )
+            .await
+            .map_err(|_| AppError::network("获取模型列表超时"))?
+            {
+                Ok(models) => models,
+                Err(rig_error) => fetch_openai_compatible_models(&base_url, api_key, insecure)
+                    .await
+                    .map_err(|fallback_error| {
+                        let rig_error = map_model_listing_error(rig_error);
+                        let fallback_detail = fallback_error
+                            .detail
+                            .as_deref()
+                            .unwrap_or(fallback_error.message.as_str())
+                            .to_string();
+                        fallback_error.with_detail(format!(
+                            "rig 获取失败：{}；/models 兜底失败：{}",
+                            rig_error.message, fallback_detail,
+                        ))
+                    })?,
+            }
+        }
+        LlmProviderPreset::MiniMax | LlmProviderPreset::Moonshot | LlmProviderPreset::ZAi => {
+            return Err(AppError::provider(
+                "该 provider 暂未提供模型列表接口，请手动填写模型名称",
+            ));
+        }
+        LlmProviderPreset::Ollama => {
+            let client = rig::providers::ollama::Client::builder()
+                .api_key(api_key)
+                .base_url(&base_url)
+                .http_client(http_client.clone())
+                .build()
+                .map_err(|error| {
+                    AppError::configuration("无法创建大模型客户端").with_detail(error.to_string())
+                })?;
+            timeout(
+                Duration::from_secs(MODEL_LIST_TIMEOUT_SECONDS),
+                client.list_models(),
+            )
+            .await
+            .map_err(|_| AppError::network("获取模型列表超时"))?
+            .map_err(map_model_listing_error)?
+        }
+        LlmProviderPreset::OpenRouter => {
+            let client = rig::providers::openrouter::Client::builder()
+                .api_key(api_key)
+                .base_url(&base_url)
+                .http_client(http_client.clone())
+                .build()
+                .map_err(|error| {
+                    AppError::configuration("无法创建大模型客户端").with_detail(error.to_string())
+                })?;
+            timeout(
+                Duration::from_secs(MODEL_LIST_TIMEOUT_SECONDS),
+                client.list_models(),
+            )
+            .await
+            .map_err(|_| AppError::network("获取模型列表超时"))?
+            .map_err(map_model_listing_error)?
+        }
+        LlmProviderPreset::XiaomiMimo => {
+            let client = rig::providers::xiaomimimo::Client::builder()
+                .api_key(api_key)
+                .base_url(&base_url)
+                .http_client(http_client.clone())
+                .build()
+                .map_err(|error| {
+                    AppError::configuration("无法创建大模型客户端").with_detail(error.to_string())
+                })?;
+            timeout(
+                Duration::from_secs(MODEL_LIST_TIMEOUT_SECONDS),
+                client.list_models(),
+            )
+            .await
+            .map_err(|_| AppError::network("获取模型列表超时"))?
+            .map_err(map_model_listing_error)?
+        }
+    };
+
+    let mut names = models
+        .into_iter()
+        .map(|model| model.id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+fn openai_compatible_models_url(base_url: &str) -> String {
+    format!("{}/models", base_url.trim().trim_end_matches('/'))
+}
+
+async fn fetch_openai_compatible_models(
+    base_url: &str,
+    api_key: &str,
+    insecure: bool,
+) -> Result<ModelList, AppError> {
+    let url = openai_compatible_models_url(base_url);
+    let client = http_client_for(insecure)?;
+    let response = timeout(
+        Duration::from_secs(MODEL_LIST_TIMEOUT_SECONDS),
+        client
+            .get(&url)
+            .bearer_auth(api_key)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send(),
+    )
+    .await
+    .map_err(|_| AppError::network("获取模型列表超时"))?
+    .map_err(|error| {
+        AppError::network("无法连接大模型服务获取模型列表").with_detail(error.to_string())
+    })?;
+
+    let status = response.status();
+    let body = response.text().await.map_err(|error| {
+        AppError::network("读取模型列表响应失败").with_detail(error.to_string())
+    })?;
+    if !status.is_success() {
+        return Err(map_openai_compatible_models_status(status.as_u16(), body));
+    }
+
+    Ok(ModelList {
+        data: parse_openai_compatible_models(&body)?,
+    })
+}
+
+fn map_openai_compatible_models_status(status_code: u16, body: String) -> AppError {
+    let mut mapped = match status_code {
+        401 | 403 => AppError::credential("大模型密钥无效或无权获取模型列表"),
+        404 => AppError::provider("大模型服务未提供模型列表接口，请手动填写模型名称"),
+        429 => AppError::provider("获取模型列表受限或账户额度不足"),
+        _ => AppError::provider(format!("获取模型列表失败（HTTP {status_code}）")),
+    };
+    mapped = mapped.with_detail(format!("HTTP {status_code}; {body}"));
+    mapped
+}
+
+fn parse_openai_compatible_models(body: &str) -> Result<Vec<Model>, AppError> {
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|error| {
+        AppError::provider("模型列表响应解析失败，请手动填写模型名称")
+            .with_detail(error.to_string())
+    })?;
+    let items = if let Some(data) = value.get("data") {
+        data.as_array()
+    } else {
+        value.as_array()
+    }
+    .ok_or_else(|| {
+        AppError::provider("模型列表响应解析失败，请手动填写模型名称").with_detail("缺少 data 数组")
+    })?;
+
+    let mut names = items
+        .iter()
+        .filter_map(|item| {
+            item.as_str()
+                .or_else(|| item.get("id").and_then(|id| id.as_str()))
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        return Err(
+            AppError::provider("模型列表响应解析失败，请手动填写模型名称")
+                .with_detail("响应中没有可用模型标识"),
+        );
+    }
+    Ok(names.into_iter().map(Model::from_id).collect())
+}
+
+fn map_model_listing_error(error: ModelListingError) -> AppError {
+    match error {
+        ModelListingError::ApiError {
+            status_code,
+            message,
+        } => {
+            let mut mapped = match status_code {
+                401 | 403 => AppError::credential("大模型密钥无效或无权获取模型列表"),
+                404 => AppError::provider("大模型服务未提供模型列表接口，请手动填写模型名称"),
+                429 => AppError::provider("获取模型列表受限或账户额度不足"),
+                _ => AppError::provider(format!("获取模型列表失败（HTTP {status_code}）")),
+            };
+            mapped = mapped.with_detail(format!("HTTP {status_code}; {message}"));
+            mapped
+        }
+        ModelListingError::RequestError { message } => {
+            AppError::network("无法连接大模型服务获取模型列表").with_detail(message)
+        }
+        ModelListingError::ParseError { message } => {
+            AppError::provider("模型列表响应解析失败，请手动填写模型名称").with_detail(message)
+        }
+        ModelListingError::AuthError { message } => {
+            AppError::credential("大模型密钥无效或无权获取模型列表").with_detail(message)
+        }
+        ModelListingError::RateLimitError { message } => {
+            AppError::provider("获取模型列表受限或账户额度不足").with_detail(message)
+        }
+        ModelListingError::ServiceUnavailable { message } => {
+            AppError::network("大模型服务暂不可用，无法获取模型列表").with_detail(message)
+        }
+        ModelListingError::UnknownError { message } => {
+            AppError::provider("获取模型列表失败").with_detail(message)
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn list_llm_models(
+    provider: LlmProviderPreset,
+    base_url: String,
+    insecure: Option<bool>,
+) -> CommandResult<Vec<String>> {
+    match fetch_model_list(provider, &base_url, insecure.unwrap_or(false)).await {
+        Ok(models) => CommandResult::ok(models),
+        Err(error) => CommandResult::err(error),
+    }
+}
+
+fn service(app_handle: tauri::AppHandle) -> Result<LlmService, crate::error::AppError> {
+    let config = crate::config::load_app_config_inner(app_handle)?;
+    let credential = credential::resolve()?;
+    LlmService::from_runtime(&config, &credential)
+}
+
+#[tauri::command]
+pub async fn test_llm_connection(app_handle: tauri::AppHandle) -> CommandResult<ConnectionReport> {
+    match service(app_handle) {
+        Ok(service) => match service.test_connection().await {
+            Ok(v) => CommandResult::ok(v),
+            Err(e) => CommandResult::err(e),
+        },
+        Err(e) => CommandResult::err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::AppErrorCode;
+
+    fn link(id: &str, model: &str) -> LlmChainLink {
+        LlmChainLink {
+            id: id.to_string(),
+            label: None,
+            provider: LlmProviderPreset::OpenAi,
+            base_url: "https://llm.example.test/v1".to_string(),
+            model: model.to_string(),
+            insecure: false,
+        }
+    }
+
+    fn chain() -> Vec<LlmChainLink> {
+        vec![
+            link(PRIMARY_LLM_ENTRY_ID, "gpt-4o"),
+            link("backup-a", "qwen-max"),
+            link("backup-b", "gpt-4o-mini"),
+        ]
+    }
+
+    #[test]
+    fn find_chain_link_hits_primary_service() {
+        let chain = chain();
+
+        let found = find_chain_link(&chain, PRIMARY_LLM_ENTRY_ID).unwrap();
+
+        assert_eq!(found.id, PRIMARY_LLM_ENTRY_ID);
+        assert_eq!(found.model, "gpt-4o");
+        assert!(found.is_primary());
+    }
+
+    #[test]
+    fn find_chain_link_hits_fallback_service() {
+        let chain = chain();
+
+        let found = find_chain_link(&chain, "backup-b").unwrap();
+
+        assert_eq!(found.id, "backup-b");
+        assert_eq!(found.model, "gpt-4o-mini");
+        assert!(!found.is_primary());
+    }
+
+    #[test]
+    fn find_chain_link_reports_an_unusable_service_clearly() {
+        let chain = chain();
+
+        // 历史坏配置可能被宽容读取为草稿；链里没有它时，错误文案要直接指向该补什么。
+        let error = find_chain_link(&chain, "backup-incomplete").unwrap_err();
+
+        assert_eq!(error.code, AppErrorCode::Configuration);
+        assert!(error.message.contains("尚不可用"));
+        assert!(error.message.contains("模型名称"));
+    }
+
+    #[test]
+    fn find_chain_link_on_empty_chain_reports_the_same_error() {
+        let error = find_chain_link(&[], PRIMARY_LLM_ENTRY_ID).unwrap_err();
+
+        assert_eq!(error.code, AppErrorCode::Configuration);
+        assert!(error.message.contains("尚不可用"));
+    }
+
+    #[test]
+    fn draft_override_takes_the_editing_values_and_trims_them() {
+        let draft = draft_override(
+            Some(LlmProviderPreset::DeepSeek),
+            Some("  https://api.deepseek.com  ".to_string()),
+            Some(true),
+        );
+
+        assert_eq!(
+            draft,
+            Some((
+                LlmProviderPreset::DeepSeek,
+                "https://api.deepseek.com".to_string(),
+                true
+            ))
+        );
+    }
+
+    #[test]
+    fn draft_override_falls_back_to_saved_config_when_incomplete() {
+        // 只传一半、空串、全不传，都退回已落盘的配置，不去猜另一半
+        assert_eq!(draft_override(Some(LlmProviderPreset::OpenAi), None, None), None);
+        assert_eq!(
+            draft_override(None, Some("https://api.openai.com/v1".to_string()), None),
+            None
+        );
+        assert_eq!(
+            draft_override(Some(LlmProviderPreset::OpenAi), Some("   ".to_string()), None),
+            None
+        );
+        assert_eq!(draft_override(None, None, Some(true)), None);
+    }
+
+    #[test]
+    fn batch_status_keeps_input_length_and_order() {
+        let entry_ids = vec![
+            PRIMARY_LLM_ENTRY_ID.to_string(),
+            "backup-b".to_string(),
+            "backup-a".to_string(),
+        ];
+
+        let statuses = collect_entry_credential_status(&entry_ids, |entry_id| {
+            Ok(CredentialStatus {
+                configured: entry_id != "backup-a",
+                source: if entry_id == "backup-a" {
+                    EffectiveCredentialSource::None
+                } else {
+                    EffectiveCredentialSource::Keychain
+                },
+            })
+        })
+        .unwrap();
+
+        assert_eq!(statuses.len(), entry_ids.len());
+        assert_eq!(
+            statuses
+                .iter()
+                .map(|s| s.entry_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![PRIMARY_LLM_ENTRY_ID, "backup-b", "backup-a"]
+        );
+        assert_eq!(
+            statuses[2],
+            LlmEntryCredentialStatus {
+                entry_id: "backup-a".to_string(),
+                configured: false,
+                source: EffectiveCredentialSource::None,
+            }
+        );
+        assert!(statuses[0].configured);
+        assert!(statuses[1].configured);
+    }
+
+    #[test]
+    fn batch_status_on_empty_input_returns_empty_list() {
+        let statuses = collect_entry_credential_status(&[], |_| {
+            panic!("空入参不应触发任何凭证读取");
+        })
+        .unwrap();
+
+        assert!(statuses.is_empty());
+    }
+
+    #[test]
+    fn batch_status_propagates_the_first_failure() {
+        let entry_ids = vec![PRIMARY_LLM_ENTRY_ID.to_string(), "backup-a".to_string()];
+
+        let error = collect_entry_credential_status(&entry_ids, |entry_id| {
+            if entry_id == PRIMARY_LLM_ENTRY_ID {
+                Ok(CredentialStatus {
+                    configured: true,
+                    source: EffectiveCredentialSource::Keychain,
+                })
+            } else {
+                Err(AppError::credential("凭证读取失败"))
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code, AppErrorCode::Credential);
+    }
+
+    #[test]
+    fn openai_compatible_models_url_normalizes_trailing_slashes() {
+        assert_eq!(
+            openai_compatible_models_url(" https://api.deepseek.com/// "),
+            "https://api.deepseek.com/models"
+        );
+        assert_eq!(
+            openai_compatible_models_url(" https://proxy.example.test/v1/ "),
+            "https://proxy.example.test/v1/models"
+        );
+        assert_eq!(
+            openai_compatible_models_url("https://proxy.example.test/v1///"),
+            "https://proxy.example.test/v1/models"
+        );
+    }
+
+    #[test]
+    fn parse_openai_compatible_models_accepts_standard_openai_payload() {
+        let models = parse_openai_compatible_models(
+            r#"{"object":"list","data":[{"id":"deepseek-chat"},{"id":"deepseek-reasoner"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            models.into_iter().map(|model| model.id).collect::<Vec<_>>(),
+            vec!["deepseek-chat", "deepseek-reasoner"]
+        );
+    }
+
+    #[test]
+    fn parse_openai_compatible_models_accepts_string_data_items() {
+        let models = parse_openai_compatible_models(r#"{"data":["model-a","model-b"]}"#).unwrap();
+
+        assert_eq!(
+            models.into_iter().map(|model| model.id).collect::<Vec<_>>(),
+            vec!["model-a", "model-b"]
+        );
+    }
+
+    #[test]
+    fn parse_openai_compatible_models_accepts_top_level_array() {
+        let models =
+            parse_openai_compatible_models(r#"[{"id":"model-a"},{"id":"model-b"}]"#).unwrap();
+
+        assert_eq!(
+            models.into_iter().map(|model| model.id).collect::<Vec<_>>(),
+            vec!["model-a", "model-b"]
+        );
+    }
+
+    #[test]
+    fn parse_openai_compatible_models_sorts_deduplicates_and_filters_blank_ids() {
+        let models = parse_openai_compatible_models(
+            r#"{"data":[{"id":" z-model "},{"id":""},{"id":"a-model"},"z-model",{"id":"   "}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            models.into_iter().map(|model| model.id).collect::<Vec<_>>(),
+            vec!["a-model", "z-model"]
+        );
+    }
+
+    #[test]
+    fn parse_openai_compatible_models_reports_missing_model_ids() {
+        let error = parse_openai_compatible_models(r#"{"data":[{"object":"model"}]}"#).unwrap_err();
+
+        assert_eq!(error.code, AppErrorCode::Provider);
+        assert!(error.message.contains("模型列表响应解析失败"));
+        assert_eq!(error.detail.as_deref(), Some("响应中没有可用模型标识"));
+    }
+
+    #[test]
+    fn batch_status_never_serializes_a_secret_field() {
+        let statuses = collect_entry_credential_status(&["backup-a".to_string()], |_| {
+            Ok(CredentialStatus {
+                configured: true,
+                source: EffectiveCredentialSource::Keychain,
+            })
+        })
+        .unwrap();
+
+        let serialized = serde_json::to_string(&statuses).unwrap();
+
+        assert_eq!(
+            serialized,
+            r#"[{"entry_id":"backup-a","configured":true,"source":"keychain"}]"#
+        );
+    }
+}

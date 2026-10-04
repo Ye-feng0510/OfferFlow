@@ -1,0 +1,109 @@
+pub mod agent;
+pub mod auto_analysis;
+pub mod browser;
+pub mod command;
+pub mod config;
+pub mod credential;
+pub mod dao;
+pub mod error;
+pub mod job_description;
+pub mod llm;
+pub mod logger;
+pub mod rpa;
+pub mod storage;
+pub mod task;
+pub mod utils;
+pub mod verify;
+use tauri::Manager;
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            let data_dir = handle.path().app_data_dir().map_err(|e| e.to_string())?;
+            let config_path = config::config_path(&handle).map_err(|e| e.to_string())?;
+            storage::migration::migrate_to_current(
+                &storage::migration::MigrationPaths::new(config_path, data_dir.clone()),
+                &credential::KeyringCredentialBackend::default(),
+            )
+            .map_err(|e| e.to_string())?;
+            browser::init_app_handle(handle.clone()).map_err(|e| e.to_string())?;
+            logger::init(&handle).map_err(|e| e.to_string())?;
+            dao::init(&data_dir).map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            command::legacy_migration::inspect_legacy_migration,
+            command::legacy_migration::migrate_legacy_data,
+            command::config::load_app_config,
+            command::config::save_app_config,
+            command::config::import_app_config,
+            command::config::export_app_config,
+            command::config::parse_resume_pdf,
+            command::config::check_browser_env,
+            command::user_resumes::load_user_resumes,
+            command::user_resumes::save_user_resumes,
+            command::resume_templates::get_resume_templates,
+            command::rpa::run_flow::check_env,
+            command::rpa::run_flow::get_readiness_report,
+            command::rpa::run_flow::preflight_job_task,
+            command::rpa::run_flow::boss_flow,
+            command::rpa::run_flow::rpa_flow,
+            command::rpa::run_flow::start_job_task,
+            command::rpa::run_flow::get_job_task_status,
+            command::rpa::run_flow::stop_job_task,
+            command::rpa::run_flow::read_log_file,
+            command::job::job_list,
+            command::job::job_list_with_status,
+            command::job::job_search_overview,
+            command::job::job_get,
+            command::job::job_create,
+            command::job::job_update,
+            command::job::job_delete,
+            command::job::job_query,
+            command::job::job_analyze,
+            command::job::job_analyze_batch,
+            command::job::job_description_view,
+            command::job::chat_messages_by_job,
+            command::communicated_jobs::job_collect_communicated,
+            command::manual_review::manual_review_list,
+            command::manual_review::manual_review_count,
+            command::manual_review::manual_review_resolve,
+            command::manual_review::manual_review_clear,
+            command::analysis::analysis_list,
+            command::analysis::analysis_get_by_job_id,
+            command::analysis::analysis_create,
+            command::analysis::analysis_delete,
+            command::llm::generate_job_filter_rules,
+            command::llm::predict_resume_questions,
+            command::llm::optimize_resume_with_answer,
+            command::llm_provider::get_llm_credential_status,
+            command::llm_provider::set_llm_api_key,
+            command::llm_provider::clear_llm_api_key,
+            command::llm_provider::list_llm_models,
+            command::llm_provider::test_llm_connection,
+            command::llm_provider::get_llm_credential_status_for,
+            command::llm_provider::set_llm_api_key_for,
+            command::llm_provider::clear_llm_api_key_for,
+            command::llm_provider::list_llm_credential_status,
+            command::llm_provider::swap_llm_credentials,
+            command::llm_provider::test_llm_entry_connection,
+            command::llm_provider::list_llm_models_for,
+            command::playground::playground_screen,
+            command::playground::playground_greet,
+            command::playground::playground_reply,
+            command::playground::playground_traces,
+            command::playground::playground_clear_traces,
+            command::playground::playground_export_traces,
+            command::mock_interview::stream_mock_interview_question,
+            command::mock_interview::stream_mock_interview_summary,
+            command::data_management::export_data_bundle,
+            command::data_management::inspect_data_bundle,
+            command::data_management::import_data_bundle
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

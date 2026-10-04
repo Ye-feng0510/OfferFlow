@@ -1,0 +1,54 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+release
+releases/
+!docs/releases/
+!docs/releases/*.md
+.codegraph
+settings.local.json
+
+# Tauri updater signing key (never commit the private key)
+.tauri/*.key
+/.tauri/
+/output/
+/.offerflow-validation/
+
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.fjbackup
+
+designs/
+
+
+.super-dev
+.playwright-mcp
+# Claude Code 的 agent 工作区，由工具自行管理
+.claude/worktrees/
+
+
+.pi

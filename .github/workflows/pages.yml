@@ -1,0 +1,71 @@
+name: Deploy GitHub Pages
+
+on:
+  workflow_dispatch:
+
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+
+jobs:
+  deploy:
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    runs-on: ubuntu-latest
+
+
+    steps:
+
+      # 拉取代码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+
+      # 构建 GitHub Pages 静态目录
+      - name: Prepare static site
+        run: |
+          rm -rf dist
+
+          mkdir -p dist/docs/images
+          mkdir -p dist/docs/user/images
+
+          # 首页
+          cp site/index.html dist/index.html
+
+          # 使用教程
+          cp site/guide.html dist/guide.html
+
+          # 图片资源
+          cp -r docs/images/* dist/docs/images/
+
+          # 教程截图
+          cp -r docs/user/images/* dist/docs/user/images/
+
+
+      # 配置 GitHub Pages
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+
+      # 上传 Pages 文件
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+
+      # 部署
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

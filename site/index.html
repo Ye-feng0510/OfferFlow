@@ -1,0 +1,841 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="OfferFlow：本地优先的开源桌面求职自动化与分析工具。"
+    />
+    <title>OfferFlow - 本地优先的开源桌面求职助手</title>
+    <style>
+      :root {
+        --bg: #f7f8fb;
+        --surface: #ffffff;
+        --surface-soft: #f1f4f8;
+        --text: #111827;
+        --muted: #667085;
+        --line: #e4e7ec;
+        --primary: #2563eb;
+        --primary-strong: #1d4ed8;
+        --green: #059669;
+        --orange: #ea580c;
+        --shadow: 0 20px 48px rgba(17, 24, 39, 0.08);
+        --radius: 24px;
+        --radius-sm: 16px;
+        --max: 1120px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+      html {
+        scroll-behavior: smooth;
+      }
+      body {
+        margin: 0;
+        font-family:
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          "PingFang SC",
+          "Microsoft YaHei",
+          sans-serif;
+        color: var(--text);
+        background: var(--bg);
+        line-height: 1.6;
+      }
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+      img {
+        display: block;
+        max-width: 100%;
+      }
+
+      .container {
+        width: min(var(--max), calc(100% - 40px));
+        margin: 0 auto;
+      }
+
+      .nav {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        background: rgba(247, 248, 251, 0.82);
+        backdrop-filter: blur(14px);
+        border-bottom: 1px solid var(--line);
+      }
+      .nav-inner {
+        height: 68px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-weight: 800;
+      }
+      .brand-mark {
+        width: 36px;
+        height: 36px;
+        display: grid;
+        place-items: center;
+        border-radius: 11px;
+        color: #fff;
+        background: var(--text);
+        font-size: 14px;
+        letter-spacing: -0.04em;
+      }
+      .nav-links {
+        display: flex;
+        align-items: center;
+        gap: 22px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .nav-links a:hover {
+        color: var(--text);
+      }
+      .download-link {
+        padding: 10px 16px;
+        color: #fff;
+        background: var(--primary);
+        border-radius: 999px;
+        font-weight: 700;
+      }
+      .download-link:hover {
+        background: var(--primary-strong);
+        color: #fff;
+      }
+
+      .hero {
+        padding: 76px 0 42px;
+      }
+      .hero-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 0.9fr) minmax(360px, 1.1fr);
+        align-items: center;
+        gap: 44px;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        color: var(--muted);
+        background: var(--surface);
+        font-size: 14px;
+        font-weight: 650;
+      }
+      h1 {
+        margin: 18px 0 18px;
+        font-size: clamp(44px, 8vw, 76px);
+        line-height: 0.96;
+        letter-spacing: -0.075em;
+      }
+      .hero p {
+        margin: 0;
+        max-width: 620px;
+        color: var(--muted);
+        font-size: 18px;
+      }
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 28px;
+      }
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        min-height: 46px;
+        padding: 12px 18px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: var(--surface);
+        font-weight: 750;
+        transition:
+          transform 0.18s ease,
+          box-shadow 0.18s ease,
+          background 0.18s ease;
+      }
+      .btn:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 12px 28px rgba(17, 24, 39, 0.08);
+      }
+      .btn-primary {
+        color: #fff;
+        background: var(--primary);
+        border-color: var(--primary);
+      }
+      .btn-primary:hover {
+        background: var(--primary-strong);
+        color: #fff;
+      }
+
+      .hero-card {
+        padding: 10px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--surface);
+        box-shadow: var(--shadow);
+      }
+      .window-bar {
+        display: flex;
+        gap: 7px;
+        padding: 12px 12px 10px;
+      }
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 999px;
+        background: #ef4444;
+      }
+      .dot:nth-child(2) {
+        background: #f59e0b;
+      }
+      .dot:nth-child(3) {
+        background: #22c55e;
+      }
+      .shot {
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: #fff;
+      }
+
+      .trust-row {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+        padding: 18px 0 58px;
+      }
+      .trust-card {
+        padding: 18px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        background: var(--surface);
+      }
+      .trust-card strong {
+        display: block;
+        font-size: 18px;
+        margin-bottom: 4px;
+      }
+      .trust-card span {
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      section {
+        padding: 58px 0;
+      }
+      .section-head {
+        max-width: 720px;
+        margin-bottom: 28px;
+      }
+      .kicker {
+        margin: 0 0 8px;
+        color: var(--primary);
+        font-weight: 800;
+        font-size: 13px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      h2 {
+        margin: 0;
+        font-size: clamp(30px, 5vw, 48px);
+        line-height: 1.05;
+        letter-spacing: -0.055em;
+      }
+      .section-head p:last-child {
+        margin: 14px 0 0;
+        color: var(--muted);
+        font-size: 17px;
+      }
+
+      .features {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+      }
+      .feature {
+        padding: 22px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        background: var(--surface);
+      }
+      .icon {
+        width: 42px;
+        height: 42px;
+        display: grid;
+        place-items: center;
+        border-radius: 12px;
+        background: var(--surface-soft);
+        font-size: 21px;
+      }
+      .feature h3 {
+        margin: 16px 0 8px;
+        font-size: 19px;
+        letter-spacing: -0.02em;
+      }
+      .feature p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 15px;
+      }
+
+      .showcases {
+        display: grid;
+        gap: 18px;
+      }
+      .showcase {
+        display: grid;
+        grid-template-columns: 360px minmax(0, 1fr);
+        gap: 18px;
+        align-items: center;
+        padding: 14px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--surface);
+        box-shadow: 0 10px 30px rgba(17, 24, 39, 0.04);
+      }
+      .showcase-copy {
+        padding: 14px 18px;
+      }
+      .pill {
+        display: inline-flex;
+        padding: 5px 10px;
+        border-radius: 999px;
+        background: #eff6ff;
+        color: var(--primary-strong);
+        font-size: 13px;
+        font-weight: 800;
+      }
+      .showcase h3 {
+        margin: 14px 0 8px;
+        font-size: 28px;
+        line-height: 1.12;
+        letter-spacing: -0.045em;
+      }
+      .showcase p {
+        margin: 0;
+        color: var(--muted);
+      }
+
+      .privacy {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 340px;
+        gap: 18px;
+        padding: 26px;
+        border-radius: var(--radius);
+        color: #fff;
+        background: #101828;
+      }
+      .privacy h2 {
+        color: #fff;
+      }
+      .privacy p {
+        color: rgba(255, 255, 255, 0.72);
+      }
+      .privacy .btn {
+        color: #101828;
+        background: #fff;
+        border-color: rgba(255, 255, 255, 0.88);
+      }
+      .privacy .btn:hover {
+        color: #101828;
+        background: #f2f4f7;
+        border-color: #f2f4f7;
+      }
+      .privacy-list {
+        display: grid;
+        gap: 10px;
+      }
+      .privacy-item {
+        padding: 14px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.06);
+        color: rgba(255, 255, 255, 0.82);
+        font-size: 14px;
+      }
+
+      .start {
+        display: grid;
+        grid-template-columns: minmax(0, 0.9fr) minmax(360px, 1.1fr);
+        gap: 24px;
+        align-items: start;
+      }
+      .steps {
+        display: grid;
+        gap: 12px;
+      }
+      .step {
+        display: grid;
+        grid-template-columns: 42px 1fr;
+        gap: 14px;
+        padding: 18px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        background: var(--surface);
+      }
+      .num {
+        width: 36px;
+        height: 36px;
+        display: grid;
+        place-items: center;
+        border-radius: 999px;
+        color: #fff;
+        background: var(--primary);
+        font-weight: 800;
+      }
+      .step h3 {
+        margin: 0 0 4px;
+        font-size: 18px;
+      }
+      .step p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 15px;
+      }
+      .code {
+        margin-top: 12px;
+        padding: 12px 14px;
+        overflow-x: auto;
+        border-radius: 12px;
+        color: #dbeafe;
+        background: #0b1220;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 13px;
+        white-space: nowrap;
+      }
+
+      .community {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 260px;
+        gap: 24px;
+        align-items: center;
+        padding: 24px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--surface);
+      }
+      .community p {
+        color: var(--muted);
+      }
+      .qr {
+        padding: 10px;
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        text-align: center;
+        background: #fff;
+      }
+      .qr img {
+        border-radius: 12px;
+      }
+      .qr strong {
+        display: block;
+        margin-top: 8px;
+      }
+
+      footer {
+        padding: 34px 0 42px;
+        border-top: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .footer-inner {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      footer a {
+        color: var(--text);
+        font-weight: 700;
+      }
+
+      @media (max-width: 900px) {
+        .hero-grid,
+        .showcase,
+        .privacy,
+        .start,
+        .community {
+          grid-template-columns: 1fr;
+        }
+        .trust-row,
+        .features {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .nav-links a:not(.download-link) {
+          display: none;
+        }
+      }
+      @media (max-width: 620px) {
+        .container {
+          width: min(100% - 28px, var(--max));
+        }
+        .hero {
+          padding-top: 48px;
+        }
+        .trust-row,
+        .features {
+          grid-template-columns: 1fr;
+        }
+        .nav-links {
+          gap: 0;
+        }
+        .brand span:last-child {
+          display: none;
+        }
+        .showcase-copy {
+          padding: 6px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="nav">
+      <div class="container nav-inner">
+        <a class="brand" href="#top" aria-label="OfferFlow 首页">
+          <span class="brand-mark">OF</span>
+          <span>OfferFlow</span>
+        </a>
+        <nav class="nav-links" aria-label="主要导航">
+          <a href="#features">功能</a>
+          <a href="#screens">截图</a>
+          <a href="#privacy">隐私</a>
+          <a href="./guide.html">使用教程</a>
+          <a
+            class="download-link"
+            href="https://github.com/Ye-feng0510/OfferFlow/releases"
+            target="_blank"
+            rel="noreferrer"
+            >发行状态</a
+          >
+        </nav>
+      </div>
+    </header>
+
+    <main id="top">
+      <section class="hero">
+        <div class="container hero-grid">
+          <div>
+            <span class="badge">🚀 开源 · 本地优先 · 无遥测</span>
+            <h1>让求职流程更可控。</h1>
+            <p>
+              OfferFlow
+              是一款开源桌面求职助手，支持岗位抓取、批量沟通、岗位分析、简历优化与模拟面试。所有核心数据都保存在本机，你决定是否接入
+              AI。
+            </p>
+            <div class="actions">
+              <a
+                class="btn btn-primary"
+                href="https://github.com/Ye-feng0510/OfferFlow"
+                target="_blank"
+                rel="noreferrer"
+                >查看源码与构建说明</a
+              >
+              <a
+                class="btn"
+                href="https://github.com/Ye-feng0510/OfferFlow"
+                target="_blank"
+                rel="noreferrer"
+                >GitHub 源码</a
+              >
+            </div>
+          </div>
+          <div class="hero-card">
+            <div class="window-bar">
+              <span class="dot"></span><span class="dot"></span
+              ><span class="dot"></span>
+            </div>
+            <div class="shot">
+              <img
+                src="./docs/images/workspace.png"
+                alt="OfferFlow 工作台截图"
+              />
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <div class="container trust-row" aria-label="项目特点">
+        <div class="trust-card">
+          <strong>本地运行</strong
+          ><span>配置、简历、岗位和聊天数据保存在本机。</span>
+        </div>
+        <div class="trust-card">
+          <strong>自动化求职</strong
+          ><span>支持 BOSS 直聘、猎聘的岗位抓取与沟通流程。</span>
+        </div>
+        <div class="trust-card">
+          <strong>AI 可选</strong><span>兼容本地模型与 OpenAI 兼容接口。</span>
+        </div>
+        <div class="trust-card">
+          <strong>开源可审计</strong
+          ><span>Apache-2.0 许可，网络边界透明可查。</span>
+        </div>
+      </div>
+
+      <section id="features">
+        <div class="container">
+          <div class="section-head">
+            <p class="kicker">Features</p>
+            <h2>核心功能，保持清晰。</h2>
+            <p>
+              官网只保留用户最关心的信息：能做什么、数据是否安全、如何下载使用。
+            </p>
+          </div>
+          <div class="features">
+            <article class="feature">
+              <div class="icon">🖥️</div>
+              <h3>工作台</h3>
+              <p>控制环境检测、扫码登录、岗位抓取、批量沟通和实时日志。</p>
+            </article>
+            <article class="feature">
+              <div class="icon">📋</div>
+              <h3>岗位管理</h3>
+              <p>集中管理岗位数据，按薪酬、经验、学历、行业和规则筛选。</p>
+            </article>
+            <article class="feature">
+              <div class="icon">🤖</div>
+              <h3>AI 分析</h3>
+              <p>用于岗位匹配、沟通话术、聊天回复、简历优化和模拟面试。</p>
+            </article>
+            <article class="feature">
+              <div class="icon">⚙️</div>
+              <h3>配置中心</h3>
+              <p>统一配置浏览器、模型、简历、筛选规则和沟通策略。</p>
+            </article>
+            <article class="feature">
+              <div class="icon">🔐</div>
+              <h3>凭据安全</h3>
+              <p>API Key 存系统钥匙串或凭据库，不写入普通配置文件。</p>
+            </article>
+            <article class="feature">
+              <div class="icon">🧪</div>
+              <h3>边界检查</h3>
+              <p>可通过脚本检查出站请求，配合开源代码进行审计。</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="screens">
+        <div class="container">
+          <div class="section-head">
+            <p class="kicker">Screens</p>
+            <h2>少量截图，说明关键流程。</h2>
+            <p>
+              减少堆叠式展示，只保留工作台、配置中心、岗位分析和模拟面试四个核心场景。
+            </p>
+          </div>
+          <div class="showcases">
+            <article class="showcase">
+              <div class="showcase-copy">
+                <span class="pill">Workspace</span>
+                <h3>自动化任务工作台</h3>
+                <p>
+                  任务状态、运行日志和平台操作集中在一个界面中，便于观察与干预。
+                </p>
+              </div>
+              <div class="shot">
+                <img
+                  src="./docs/images/workspace.png"
+                  alt="自动化任务工作台截图"
+                />
+              </div>
+            </article>
+            <article class="showcase">
+              <div class="showcase-copy">
+                <span class="pill">Config</span>
+                <h3>配置中心</h3>
+                <p>
+                  管理浏览器、模型、简历、岗位筛选和沟通话术，让自动化行为更可控。
+                </p>
+              </div>
+              <div class="shot">
+                <img
+                  src="./docs/images/config-center.png"
+                  alt="配置中心截图"
+                />
+              </div>
+            </article>
+            <article class="showcase">
+              <div class="showcase-copy">
+                <span class="pill">Analysis</span>
+                <h3>岗位分析</h3>
+                <p>
+                  结合岗位描述与简历上下文，辅助判断匹配度、风险点和沟通重点。
+                </p>
+              </div>
+              <div class="shot">
+                <img
+                  src="./docs/images/377a1769475fa26c0eb89b3845f36edc.png"
+                  alt="岗位分析截图"
+                />
+              </div>
+            </article>
+            <article class="showcase">
+              <div class="showcase-copy">
+                <span class="pill">Interview</span>
+                <h3>模拟面试</h3>
+                <p>围绕目标岗位生成面试问题和准备方向，帮助快速复盘表达。</p>
+              </div>
+              <div class="shot">
+                <img
+                  src="./docs/images/b7345c3578d6f2fcf5570da40916d5dc.png"
+                  alt="AI 模拟面试截图"
+                />
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="privacy">
+        <div class="container privacy">
+          <div>
+            <p class="kicker">Privacy First</p>
+            <h2>不把求职数据交给黑盒服务。</h2>
+            <p>
+              OfferFlow 默认本地保存数据，无账号体系、无遥测、无云端同步。AI
+              是可选能力，你可以使用本地模型，也可以接入自己信任的服务。
+            </p>
+            <div class="actions">
+              <a
+                class="btn"
+                href="https://github.com/Ye-feng0510/OfferFlow/blob/master/docs/privacy-and-network.md"
+                target="_blank"
+                rel="noreferrer"
+                >查看隐私与网络文档</a
+              >
+            </div>
+          </div>
+          <div class="privacy-list">
+            <div class="privacy-item">
+              ✅ 配置、岗位、聊天、简历数据仅存储在本机
+            </div>
+            <div class="privacy-item">✅ 密钥进入系统钥匙串 / 凭据库</div>
+            <div class="privacy-item">✅ 敏感日志自动脱敏</div>
+            <div class="privacy-item">✅ 可运行网络边界检查脚本</div>
+          </div>
+        </div>
+      </section>
+
+      <section id="start">
+        <div class="container start">
+          <div class="section-head">
+            <p class="kicker">Get Started</p>
+            <h2>从源码构建，配置后开始使用。</h2>
+            <p>独立仓库暂未发布安装包，也未启用自动更新。请参考仓库说明自行构建。</p>
+            <div class="actions">
+              <a
+                class="btn btn-primary"
+                href="https://github.com/Ye-feng0510/OfferFlow"
+                target="_blank"
+                rel="noreferrer"
+                >查看构建说明</a
+              >
+              <a class="btn" href="./guide.html">📘 查看使用教程</a>
+            </div>
+          </div>
+          <div class="steps">
+            <article class="step">
+              <div class="num">1</div>
+              <div>
+                <h3>自行构建</h3>
+                <p>按仓库 README 安装开发环境，并在本机构建对应平台的应用。</p>
+              </div>
+            </article>
+            <article class="step">
+              <div class="num">2</div>
+              <div>
+                <h3>完成本地安装</h3>
+                <p>macOS 自行构建版本如被隔离拦截，仅在确认来源可信后移除隔离标记。</p>
+                <div class="code">
+                  xattr -dr com.apple.quarantine /Applications/OfferFlow.app
+                </div>
+              </div>
+            </article>
+            <article class="step">
+              <div class="num">3</div>
+              <div>
+                <h3>进入配置中心</h3>
+                <p>设置浏览器、简历、筛选规则和可选 AI 模型，然后启动任务。</p>
+                <p>
+                  详细步骤见
+                  <a href="./guide.html" style="color: var(--primary)"
+                    >使用教程</a
+                  >。
+                </p>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="community">
+        <div class="container community">
+          <div>
+            <p class="kicker">Community</p>
+            <h2>反馈问题与建议。</h2>
+            <p>
+              欢迎通过 GitHub Issues 反馈平台适配、自动化流程、AI
+              配置和使用体验问题。
+            </p>
+            <div class="actions">
+              <a
+                class="btn"
+                href="https://github.com/Ye-feng0510/OfferFlow/issues"
+                target="_blank"
+                rel="noreferrer"
+                >提交 Issue</a
+              >
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="container footer-inner">
+        <span>OfferFlow · Apache License 2.0 · 上游来源见仓库 README</span>
+        <span
+          ><a
+            href="https://github.com/Ye-feng0510/OfferFlow"
+            target="_blank"
+            rel="noreferrer"
+            >GitHub</a
+          >
+          ·
+          <a
+            href="https://github.com/Ye-feng0510/OfferFlow/releases"
+            target="_blank"
+            rel="noreferrer"
+            >发行状态（暂未发布）</a
+          >
+          ·
+          <a
+            href="https://github.com/Ye-feng0510/OfferFlow/blob/master/LICENSE"
+            target="_blank"
+            rel="noreferrer"
+            >License</a
+          ></span
+        >
+      </div>
+    </footer>
+  </body>
+</html>

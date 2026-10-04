@@ -1,0 +1,391 @@
+use serde::{Deserialize, Serialize};
+
+use crate::config::{
+    AnalysisConfig, AppRuntimeConfig, GreetConfig, JobFilterConfig, PlatformFilterConfig,
+    ReplayConfig, ResumeConfig,
+};
+
+/// 一次求职任务实际使用的不可变方案内容。
+///
+/// 这里只保存方案拥有的策略，不复制浏览器、模型提供商等全局配置。
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct JobProfileSnapshot {
+    pub snapshot_id: String,
+    pub profile_id: String,
+    pub profile_name: String,
+    pub job_filter_config: JobFilterConfig,
+    pub platform_filter_config: PlatformFilterConfig,
+    pub greet_config: GreetConfig,
+    pub replay_config: ReplayConfig,
+    pub resume_config: ResumeConfig,
+    /// 升级前的快照没有这块，按「不自动分析」恢复
+    #[serde(default)]
+    pub analysis_config: AnalysisConfig,
+}
+
+impl JobProfileSnapshot {
+    pub fn from_resolved(config: &AppRuntimeConfig) -> Option<Self> {
+        let active = config.active_job_profile.as_ref()?;
+        Some(Self {
+            snapshot_id: active.snapshot_id.clone(),
+            profile_id: active.id.clone(),
+            profile_name: active.name.clone(),
+            job_filter_config: config.job_filter_config.clone(),
+            platform_filter_config: config.platform_filter_config.clone(),
+            greet_config: config.greet_config.clone(),
+            replay_config: config.replay_config.clone(),
+            resume_config: config.resume_config.clone(),
+            analysis_config: config.analysis_config.clone(),
+        })
+    }
+
+    pub fn apply_to(&self, base: &AppRuntimeConfig) -> AppRuntimeConfig {
+        let mut config = base.clone();
+        config.job_filter_config = self.job_filter_config.clone();
+        config.platform_filter_config = self.platform_filter_config.clone();
+        config.greet_config = self.greet_config.clone();
+        config.replay_config = self.replay_config.clone();
+        config.resume_config = self.resume_config.clone();
+        config.analysis_config = self.analysis_config.clone();
+        config.active_job_profile = Some(crate::config::ActiveJobProfile {
+            id: self.profile_id.clone(),
+            name: self.profile_name.clone(),
+            snapshot_id: self.snapshot_id.clone(),
+        });
+        config
+    }
+}
+
+/// 岗位详情表
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct JobDetail {
+    /// 岗位唯一ID
+    pub id: String,
+
+    /// 岗位来源平台: boss / liepin
+    #[serde(default)]
+    pub platform: String,
+
+    /// 首次建联任务。旧数据没有该字段时保持为空。
+    #[serde(default)]
+    pub source_task_id: Option<String>,
+
+    /// 首次建联使用的求职方案。
+    #[serde(default)]
+    pub profile_id: Option<String>,
+
+    /// 冗余保存方案名称，便于历史任务和岗位直接展示。
+    #[serde(default)]
+    pub profile_name: Option<String>,
+
+    /// 首次建联时不可变方案快照的标识。
+    #[serde(default)]
+    pub profile_snapshot_id: Option<String>,
+
+    /// 岗位标题
+    pub title: String,
+
+    /// 公司名称
+    pub company_name: String,
+
+    /// 岗位描述（JD全文）
+    pub detail: String,
+
+    /// 薪资范围，例如：20k-40k·14薪
+    pub salary: String,
+
+    /// 工作地点
+    pub location: Option<String>,
+
+    /// 是否已与招聘方沟通/获得回复
+    /// 默认 false
+    pub is_reply: bool,
+
+    /// 是否已投递简历
+    /// 默认 false
+    pub is_send_resume: bool,
+
+    /// 创建时间（收藏或导入岗位时间）
+    pub created_at: String,
+
+    /// 投递时间
+    /// 未投递则为 None
+    pub resume_sent_at: Option<String>,
+
+    /// 最后更新时间
+    pub updated_at: String,
+}
+
+/// 岗位面试分析结果
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct InterviewJobAnalysis {
+    /// 关联岗位ID
+    pub job_id: String,
+
+    /// 分析时间
+    pub analyzed_at: String,
+
+    /// 总体匹配结论
+    pub fit_summary: String,
+
+    /// 匹配度评分（0~100）
+    pub match_score: u8,
+
+    /// 与岗位匹配的优势项
+    pub strengths: Vec<String>,
+
+    /// 风险项/短板项
+    pub risks: Vec<String>,
+
+    /// 技能匹配矩阵
+    pub skill_matrix: Vec<SkillEvidence>,
+
+    /// 预测面试问题
+    pub likely_questions: Vec<InterviewQuestion>,
+
+    /// 建议向面试官提问的问题
+    pub questions_to_ask_interviewer: Vec<String>,
+
+    /// 联网搜索摘要
+    #[serde(default)]
+    pub search_summary: String,
+
+    /// 联网搜索来源
+    #[serde(default)]
+    pub search_sources: Vec<SearchSource>,
+
+    /// 分析时使用的沟通上下文
+    #[serde(default)]
+    pub chat_context: String,
+
+    /// LLM原始返回内容
+    pub raw_response: String,
+
+    /// 解析错误信息
+    /// 解析成功则为 None
+    pub parse_error: Option<String>,
+}
+
+/// 联网搜索来源
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SearchSource {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+/// 技能要求与简历证据映射
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SkillEvidence {
+    /// JD中的技能要求
+    pub requirement: String,
+
+    /// 简历中的相关经历或证据
+    pub resume_evidence: String,
+
+    /// 能力差距分析
+    pub gap: String,
+
+    /// 面试前补强建议
+    pub prep_action: String,
+}
+
+/// 面试问题预测
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct InterviewQuestion {
+    /// 问题类别
+    /// 如：技术、项目经历、行为面试、系统设计等
+    pub category: String,
+
+    /// 面试问题
+    pub question: String,
+
+    /// 面试官提问意图
+    pub why: String,
+
+    /// 建议回答框架
+    pub answer_outline: String,
+}
+
+/// 聊天消息持久化记录。
+///
+/// 主键从 job_id 换成「平台 + 会话标识」，是因为猎聘的会话未必映射得到岗位：
+/// 它的 IM 接口不给岗位 ID，公司重名时无法可靠归属。按 job_id 存等于这类会话
+/// 一条都存不下来，历史上下文也就无从谈起。
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatMessageRecord {
+    /// 复合主键: "{platform}:{conversation_id}:{mid}"
+    pub id: String,
+
+    /// 归属岗位。猎聘映射不到岗位时为空，不影响消息落库
+    #[serde(default)]
+    pub job_id: String,
+
+    /// 来源平台: boss / liepin。
+    /// 旧数据没有该字段，迁移时按 boss 回填——猎聘此前从未落过库
+    #[serde(default)]
+    pub platform: String,
+
+    /// 会话稳定标识。BOSS 为 encryptJobId，猎聘为 imid。
+    /// 旧数据没有该字段，迁移时用 job_id 回填
+    #[serde(default)]
+    pub conversation_id: String,
+
+    pub mid: i64,
+    /// true = 招聘者发送，false = 自己发送
+    pub received: bool,
+    pub text: String,
+    /// 发送时间戳（毫秒）
+    pub time: i64,
+    pub from_name: String,
+}
+
+impl ChatMessageRecord {
+    /// 复合主键的唯一构造入口。散着拼字符串迟早会拼出两种格式
+    pub fn build_id(platform: &str, conversation_id: &str, mid: i64) -> String {
+        format!("{platform}:{conversation_id}:{mid}")
+    }
+}
+
+/// 一次自动发送动作的性质。
+///
+/// 节流只数 [`Self::Reply`]：模板回复是用户写死的固定话术，
+/// 同意简历请求是既定策略，两者都不该占「和 HR 客套了几轮」的额度。
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoReplyAction {
+    /// 模型生成的回复
+    Reply,
+    /// 命中正则模板发送的固定话术
+    Template,
+    /// 投递简历（主动投递或同意对方索要）
+    Resume,
+}
+
+/// 自动发送流水。
+///
+/// 存在的唯一理由是聊天记录区分不出「AI 发的」和「你手工发的」——
+/// `ChatMessageRecord.received == false` 对两者一视同仁。没有这张流水，
+/// 时间窗节流数不出 AI 到底自动回了几条，待办列表也判断不出你是否已经接手。
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct AutoReplyLogRecord {
+    /// 复合主键: "{platform}:{conversation_id}:{sent_at_ms}"
+    pub id: String,
+    pub platform: String,
+    pub conversation_id: String,
+    /// 归属岗位。猎聘映射不到岗位时为空
+    #[serde(default)]
+    pub job_id: String,
+    pub action: AutoReplyAction,
+    /// 发送时刻（毫秒时间戳）
+    pub sent_at: i64,
+    /// 发送字数。仅供排查，节流不看它
+    #[serde(default)]
+    pub chars: usize,
+}
+
+impl AutoReplyLogRecord {
+    pub fn build_id(platform: &str, conversation_id: &str, sent_at: i64) -> String {
+        format!("{platform}:{conversation_id}:{sent_at}")
+    }
+}
+
+/// 一个会话被挂起等待人工的原因。
+///
+/// 只有「消息已经被读掉、但一个字都没回出去」的情况才在这里出现。
+/// 模型主动判定无需回复不算——那是正常决策，不是待办。
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualReviewReason {
+    /// 对方消息涉及证件、转账一类的高风险话题
+    RiskKeyword,
+    /// 模型生成了内容，但没通过发送前体检
+    VetRejected,
+    /// 拿不到稳定的会话标识，整条链路无从进行
+    MissingJobId,
+    /// 时间窗内的自动回复额度已用完
+    ThrottleExhausted,
+}
+
+impl ManualReviewReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RiskKeyword => "涉及敏感话题",
+            Self::VetRejected => "生成内容未通过体检",
+            Self::MissingJobId => "会话标识缺失",
+            Self::ThrottleExhausted => "自动回复额度用尽",
+        }
+    }
+}
+
+/// 待人工处理的会话。
+///
+/// 同一会话反复触发时更新同一条并累加 `hit_count`，不新增记录：
+/// 一个 HR 连发三条敏感消息应该是列表里的一行，不是三行。
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ManualReviewRecord {
+    /// 复合主键: "{platform}:{conversation_id}"
+    pub id: String,
+    pub platform: String,
+    pub conversation_id: String,
+    #[serde(default)]
+    pub job_id: String,
+    /// 岗位名与公司名，列表里要能直接看懂是哪个机会
+    #[serde(default)]
+    pub job_name: String,
+    #[serde(default)]
+    pub company_name: String,
+    pub reason: ManualReviewReason,
+    /// 面向用户的一句话说明，可含具体命中的关键词
+    pub detail: String,
+    /// 触发时对方最后一条消息的摘要，用于在列表里唤起记忆
+    #[serde(default)]
+    pub last_message: String,
+    /// 首次触发时刻（毫秒时间戳）
+    pub created_at: i64,
+    /// 最近一次触发时刻（毫秒时间戳）
+    pub updated_at: i64,
+    /// 累计触发次数
+    #[serde(default = "default_hit_count")]
+    pub hit_count: usize,
+}
+
+fn default_hit_count() -> usize {
+    1
+}
+
+impl ManualReviewRecord {
+    pub fn build_id(platform: &str, conversation_id: &str) -> String {
+        format!("{platform}:{conversation_id}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{default_app_config, resolve_job_profile};
+
+    #[test]
+    fn snapshot_restores_original_profile_strategy_after_base_changes() {
+        let base = default_app_config();
+        let resolved = resolve_job_profile(&base, None).unwrap();
+        let snapshot = JobProfileSnapshot::from_resolved(&resolved.config).unwrap();
+        let original_query = snapshot.job_filter_config.query.clone();
+        let original_prompt = snapshot.greet_config.reply_prompt.clone();
+
+        let mut edited = base;
+        edited.job_filter_config.query = Some("完全不同的岗位".into());
+        edited.greet_config.reply_prompt = Some("已经修改的新提示词".into());
+        let restored = snapshot.apply_to(&edited);
+
+        assert_eq!(restored.job_filter_config.query, original_query);
+        assert_eq!(restored.greet_config.reply_prompt, original_prompt);
+        assert_eq!(
+            restored
+                .active_job_profile
+                .as_ref()
+                .map(|value| value.snapshot_id.as_str()),
+            Some(snapshot.snapshot_id.as_str())
+        );
+    }
+}

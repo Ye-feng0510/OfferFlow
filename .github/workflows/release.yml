@@ -1,0 +1,17 @@
+name: Release (disabled)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  notice:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain independent release status
+        run: |
+          echo "OfferFlow independent releases are not configured."
+          echo "No builds, signing, uploads or publication will be performed."
+          echo "Configure independently owned signing keys and review the release workflow before enabling releases."
