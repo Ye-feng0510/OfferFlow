@@ -292,8 +292,7 @@ impl AutoReplyLogRecord {
 
 /// 一个会话被挂起等待人工的原因。
 ///
-/// 只有「消息已经被读掉、但一个字都没回出去」的情况才在这里出现。
-/// 模型主动判定无需回复不算——那是正常决策，不是待办。
+/// 自动处理需要暂停并交给人工的情况。模型判定无需回复（Skip）不是待办。
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ManualReviewReason {
@@ -301,6 +300,8 @@ pub enum ManualReviewReason {
     RiskKeyword,
     /// 模型生成了内容，但没通过发送前体检
     VetRejected,
+    /// 模型明确请求人工接手，不等同于无需回复
+    ModelEscalation,
     /// 拿不到稳定的会话标识，整条链路无从进行
     MissingJobId,
     /// 时间窗内的自动回复额度已用完
@@ -312,6 +313,7 @@ impl ManualReviewReason {
         match self {
             Self::RiskKeyword => "涉及敏感话题",
             Self::VetRejected => "生成内容未通过体检",
+            Self::ModelEscalation => "模型请求人工接手",
             Self::MissingJobId => "会话标识缺失",
             Self::ThrottleExhausted => "自动回复额度用尽",
         }

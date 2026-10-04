@@ -103,13 +103,25 @@ export default function ManualReviewDrawer({
     Modal.confirm({
       title: "清空待处理列表",
       icon: <ExclamationCircleOutlined />,
-      content: `将移除全部 ${records.length} 条记录。这些会话本身不受影响，只是不再提醒你。`,
-      okText: "清空",
+      content: `将移除全部 ${records.length} 条记录并解除自动处理暂停。后续未读消息可能再次触发自动回复或简历发送；开关和安全检查仍然有效，不会立即补发。`,
+      okText: "清空并解除暂停",
       okButtonProps: { danger: true },
       cancelText: "取消",
       onOk: onClear,
     });
   }, [onClear, records.length]);
+
+  const confirmResolve = (record: ManualReviewRecord) => {
+    Modal.confirm({
+      title: "已处理，恢复自动处理？",
+      icon: <ExclamationCircleOutlined />,
+      content:
+        "这会移除本条记录并解除暂停。后续未读消息可能触发自动回复或简历发送，仍受开关和安全检查限制，不会立即补发。",
+      okText: "确认恢复",
+      cancelText: "取消",
+      onOk: () => onResolve(record),
+    });
+  };
 
   return (
     <Drawer
@@ -125,6 +137,10 @@ export default function ManualReviewDrawer({
         ) : null
       }
     >
+      <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
+        挂起期间暂停自动回复、简历发送及模型调用。检测到挂起后的手工回复会自动解除；
+        额度用尽的挂起会在再次检查到滚动额度恢复时解除。普通追问不会解除其他挂起。
+      </Typography.Paragraph>
       {records.length === 0 ? (
         <Empty
           image={Empty.PRESENTED_IMAGE_SIMPLE}
@@ -132,7 +148,7 @@ export default function ManualReviewDrawer({
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
               {loading
                 ? "加载中"
-                : "没有需要你接手的会话。AI 读了消息却决定不回时，会把会话放到这里，不会让它悄悄过去"}
+                : "没有需要你接手的会话。安全检查拦截或模型请求人工接手时会显示在这里；正常无需回复的决定不会进入列表"}
             </Typography.Text>
           }
         />
@@ -155,8 +171,8 @@ export default function ManualReviewDrawer({
                       </Button>,
                     ]
                   : []),
-                <Button key="resolve" size="small" type="link" onClick={() => onResolve(record)}>
-                  已处理
+                <Button key="resolve" size="small" type="link" onClick={() => confirmResolve(record)}>
+                  已处理，恢复自动
                 </Button>,
               ]}
             >

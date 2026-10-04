@@ -3,12 +3,12 @@ import type { PlatformKind } from "./rpa";
 /**
  * 一个会话被挂起等待人工的原因。
  *
- * 只收「消息已经被读掉、但一个字都没回出去」的情况。模型主动判定无需回复
- * 不在此列——那是正常决策，混进来只会让列表被日常寒暄淹没。
+ * 自动处理需要暂停并交给人工的情况。模型判定无需回复（Skip）不在此列。
  */
 export type ManualReviewReason =
   | "risk_keyword"
   | "vet_rejected"
+  | "model_escalation"
   | "missing_job_id"
   | "throttle_exhausted";
 
@@ -35,6 +35,7 @@ export interface ManualReviewRecord {
 export const MANUAL_REVIEW_REASON_LABELS: Record<ManualReviewReason, string> = {
   risk_keyword: "涉及敏感话题",
   vet_rejected: "回复未通过体检",
+  model_escalation: "模型请求人工接手",
   missing_job_id: "会话标识缺失",
   throttle_exhausted: "自动回复额度用尽",
 };
@@ -48,6 +49,7 @@ export const MANUAL_REVIEW_REASON_COLORS: Record<ManualReviewReason, string> = {
   risk_keyword: "red",
   throttle_exhausted: "orange",
   vet_rejected: "gold",
+  model_escalation: "orange",
   missing_job_id: "default",
 };
 

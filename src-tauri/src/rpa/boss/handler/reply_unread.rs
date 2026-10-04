@@ -5,8 +5,7 @@ use rust_drission::utils::sleep_random_ms;
 
 use crate::{
     agent::{tasks::ReplyDecisionTask, AgentRunner},
-    auto_analysis,
-    browser,
+    auto_analysis, browser,
     config::{AnalysisTrigger, AppRuntimeConfig},
     dao::{
         auto_reply_log_dao, chat_message_dao, job_detail_dao,
@@ -28,7 +27,9 @@ use crate::{
             self, ConversationActions, ConversationContext, GateVerdict, ReplyAction, ReplyLimits,
             ReplyRoute, ResumeState,
         },
-        reply_effects::{hold_for_review, record_auto_send, release_if_handled, wait_before_reply},
+        reply_effects::{
+            hold_for_review, outbound_allowed, pending_review, record_auto_send, wait_before_reply,
+        },
         run_flow::{is_job_task_stop_requested, PlatformKind},
     },
 };
@@ -257,7 +258,7 @@ async fn handle_conversation(
             conversation::review_draft(None, &fresh),
             ManualReviewReason::MissingJobId,
             "会话标识读取失败，自动回复无法进行".to_string(),
-        );
+        )?;
         return Ok(());
     };
 
@@ -305,19 +306,32 @@ async fn handle_conversation(
     let actions = BossActions;
     let limits = ReplyLimits::from_config(&conversation_config.replay_config);
 
-    // 用户在平台里自己回过之后，待办就该消掉，不必等他回应用里手工点一次
-    release_if_handled(PLATFORM, job_id, &messages);
-
     let resume_state = actions.resume_state(page)?;
 
-    // 查不到流水按 0 算：节流数据缺失不该让整个会话卡死，
-    // 最坏后果是多回一条，比该回的不回轻得多
-    let auto_replies_in_window = auto_reply_log_dao::count_replies_within(
-        PLATFORM,
-        job_id,
-        limits.auto_reply_window_hours,
-    )
-    .unwrap_or(0);
+    // 额度读取失败不能当成额度恢复，否则会绕过节流挂起。
+    let auto_replies_in_window =
+        auto_reply_log_dao::count_replies_within(PLATFORM, job_id, limits.auto_reply_window_hours)?;
+
+    // jobId 缺失时待办使用卡片标识；恢复 jobId 后也必须检查旧标识，
+    // 否则同一会话会绕过之前的人工挂起。
+    let review_ids = if card_key == job_id {
+        vec![job_id]
+    } else {
+        vec![job_id, card_key]
+    };
+    for id in &review_ids {
+        if pending_review(
+            PLATFORM,
+            id,
+            job_id,
+            &messages,
+            auto_replies_in_window,
+            &limits,
+        )? {
+            logger::info("本会话仍待人工处理，暂停全部自动动作")?;
+            return Ok(());
+        }
+    }
 
     let context = ConversationContext {
         platform: PlatformKind::Boss,
@@ -347,7 +361,7 @@ async fn handle_conversation(
                 conversation::review_draft(context.job.as_ref(), &context.messages),
                 kind,
                 reason,
-            );
+            )?;
             return Ok(());
         }
         GateVerdict::Proceed => {}
@@ -355,6 +369,9 @@ async fn handle_conversation(
 
     // 对方主动索要简历就同意——这是既定策略，不占模型的决策位。
     // 放在闸门之后：闸门拦下的正是诈骗特征那类会话，那时把简历发出去最不该
+    if !outbound_allowed(PLATFORM, &review_ids)? {
+        return Ok(());
+    }
     if resume_state == ResumeState::RequestedByPeer {
         if limits.dry_run {
             logger::info("[演练] 对方索要简历，实际运行时会自动同意")?;
@@ -379,7 +396,14 @@ async fn handle_conversation(
             }
             // 固定话术不过发送前体检：那是给模型生成内容做的，
             // 拿它截断或否决用户写死的原话，只会让「固定回复」变得不固定
-            send_messages(page, hit.resources)?;
+            for resource in hit.resources {
+                if !outbound_allowed(PLATFORM, &review_ids)? {
+                    return Ok(());
+                }
+                if !send_messages(page, vec![resource])? {
+                    return Ok(());
+                }
+            }
             logger::info(format!("已按回复规则「{rule}」发送 {count} 条内容"))?;
             record_auto_send(PLATFORM, job_id, job_id, AutoReplyAction::Template, 0);
             return Ok(());
@@ -391,6 +415,9 @@ async fn handle_conversation(
         ReplyRoute::Decide => {}
     }
 
+    if !outbound_allowed(PLATFORM, &review_ids)? {
+        return Ok(());
+    }
     let outcome = AgentRunner::new(&conversation_config)
         .with_cancel(is_job_task_stop_requested)
         .run(&ReplyDecisionTask::new(&conversation_config, &context))
@@ -406,6 +433,16 @@ async fn handle_conversation(
         decision.reason
     ))?;
 
+    if let Some((reason, detail)) = conversation::decision_review(&decision) {
+        hold_for_review(
+            PLATFORM,
+            job_id,
+            conversation::review_draft(context.job.as_ref(), &context.messages),
+            reason,
+            detail,
+        )?;
+        return Ok(());
+    }
     if !action.needs_text() {
         return Ok(());
     }
@@ -422,7 +459,7 @@ async fn handle_conversation(
                 conversation::review_draft(context.job.as_ref(), &context.messages),
                 ManualReviewReason::VetRejected,
                 format!("生成的回复未通过发送前体检：{reason}"),
-            );
+            )?;
             return Ok(());
         }
     };
@@ -440,15 +477,27 @@ async fn handle_conversation(
         return Ok(());
     }
 
+    if !outbound_allowed(PLATFORM, &review_ids)? {
+        return Ok(());
+    }
     if !actions.send_text(page, &text)? {
         logger::warning("回复发送失败")?;
         return Ok(());
     }
     logger::info(format!("回复已发送（{} 字）", text.chars().count()))?;
-    record_auto_send(PLATFORM, job_id, job_id, AutoReplyAction::Reply, text.chars().count());
+    record_auto_send(
+        PLATFORM,
+        job_id,
+        job_id,
+        AutoReplyAction::Reply,
+        text.chars().count(),
+    );
 
     if action == ReplyAction::ReplyAndSendResume {
         sleep_random_ms(800, 1200);
+        if !outbound_allowed(PLATFORM, &review_ids)? {
+            return Ok(());
+        }
         if actions.send_resume(page)? {
             logger::info("已主动投递简历")?;
             mark_resume_sent(job_id);

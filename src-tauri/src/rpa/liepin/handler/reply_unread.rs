@@ -6,8 +6,7 @@ use serde::Deserialize;
 
 use crate::{
     agent::{tasks::ReplyDecisionTask, AgentRunner},
-    auto_analysis,
-    browser,
+    auto_analysis, browser,
     config::{AnalysisTrigger, AppRuntimeConfig},
     dao::{
         auto_reply_log_dao, chat_message_dao, job_detail_dao,
@@ -28,7 +27,9 @@ use crate::{
             },
             LIEPIN_USER_HOME_URL,
         },
-        reply_effects::{hold_for_review, record_auto_send, release_if_handled, wait_before_reply},
+        reply_effects::{
+            hold_for_review, outbound_allowed, pending_review, record_auto_send, wait_before_reply,
+        },
         run_flow::{is_job_task_stop_requested, PlatformKind},
     },
 };
@@ -175,7 +176,11 @@ pub async fn reply_unread_on_page(
                 truncate_str(latest, 30)
             ))?;
 
-            handle_conversation(page, &config, &contact, &fresh_messages, message_source).await?;
+            if let Err(error) =
+                handle_conversation(page, &config, &contact, &fresh_messages, message_source).await
+            {
+                logger::warning(format!("猎聘处理会话失败，跳过该会话继续：{error}"))?;
+            }
 
             sleep_random_ms(2500, 4500);
         }
@@ -253,19 +258,28 @@ async fn handle_conversation(
     let limits = ReplyLimits::from_config(&conversation_config.replay_config);
     let actions = LiepinActions;
 
-    // 用户在平台里自己回过之后，待办就该消掉，不必等他回应用里手工点一次
-    release_if_handled(PLATFORM, &contact.imid, &messages);
-
     let resume_state = actions.resume_state(page)?;
 
-    // 查不到流水按 0 算：节流数据缺失不该让整个会话卡死，
-    // 最坏后果是多回一条，比该回的不回轻得多
+    // 额度读取失败不能当成额度恢复，否则会绕过节流挂起。
     let auto_replies_in_window = auto_reply_log_dao::count_replies_within(
         PLATFORM,
         &contact.imid,
         limits.auto_reply_window_hours,
-    )
-    .unwrap_or(0);
+    )?;
+
+    // DOM 的时间是抓取时刻，不能据此判定用户在挂起之后手工回复。
+    if pending_review(
+        PLATFORM,
+        &contact.imid,
+        &contact.imid,
+        if from_api { &messages } else { &[] },
+        auto_replies_in_window,
+        &limits,
+    )? {
+        logger::info("猎聘会话仍待人工处理，暂停全部自动动作")?;
+        return Ok(());
+    }
+    let review_ids = [contact.imid.as_str()];
 
     let context = ConversationContext {
         platform: PlatformKind::Liepin,
@@ -291,7 +305,7 @@ async fn handle_conversation(
                 conversation::review_draft(context.job.as_ref(), &context.messages),
                 kind,
                 reason,
-            );
+            )?;
             return Ok(());
         }
         GateVerdict::Proceed => {}
@@ -299,6 +313,9 @@ async fn handle_conversation(
 
     // 对方来要简历就同意，和 Boss 侧"别人请求、我们确认发送"是同一条规则。
     // 放在取完消息之后，这条请求本身也会进上下文，回复时模型知道刚同意过
+    if !outbound_allowed(PLATFORM, &review_ids)? {
+        return Ok(());
+    }
     if resume_state == ResumeState::RequestedByPeer {
         if limits.dry_run {
             logger::info("猎聘演练模式：对方索要简历，实际运行时会点同意")?;
@@ -331,9 +348,14 @@ async fn handle_conversation(
 
             // 固定话术不过发送前体检：那是给模型生成内容做的体检，
             // 拿它去截断或否决用户的原话，只会让"固定回复"变得不固定
-            if let Err(error) = send_resources(page, hit.resources) {
-                logger::warning(format!("猎聘模板回复发送失败，跳过该会话：{}", error))?;
-                return Ok(());
+            for resource in hit.resources {
+                if !outbound_allowed(PLATFORM, &review_ids)? {
+                    return Ok(());
+                }
+                if let Err(error) = send_resources(page, vec![resource]) {
+                    logger::warning(format!("猎聘模板回复发送失败，跳过该会话：{}", error))?;
+                    return Ok(());
+                }
             }
             logger::info(format!(
                 "猎聘命中回复规则「{}」，已发送 {} 条资源",
@@ -355,6 +377,9 @@ async fn handle_conversation(
         ReplyRoute::Decide => {}
     }
 
+    if !outbound_allowed(PLATFORM, &review_ids)? {
+        return Ok(());
+    }
     let decision = match AgentRunner::new(&conversation_config)
         .with_cancel(is_job_task_stop_requested)
         .run(&ReplyDecisionTask::new(&conversation_config, &context))
@@ -369,6 +394,15 @@ async fn handle_conversation(
 
     let action = reconcile(&decision, resume_state, &limits);
     let label = action_label(action);
+    if let Some((reason, detail)) = conversation::decision_review(&decision) {
+        hold_for_review(
+            PLATFORM,
+            &contact.imid,
+            conversation::review_draft(context.job.as_ref(), &context.messages),
+            reason,
+            detail,
+        )?;
+    }
     if !action.needs_text() {
         // 决策理由不含求职者隐私，打出来用户才知道机器为什么按兵不动
         let message = format!("猎聘会话「{}」{}：{}", name, label, decision.reason);
@@ -392,7 +426,7 @@ async fn handle_conversation(
                 conversation::review_draft(context.job.as_ref(), &context.messages),
                 ManualReviewReason::VetRejected,
                 format!("生成的回复未通过发送前体检：{reason}"),
-            );
+            )?;
             return Ok(());
         }
     };
@@ -412,6 +446,9 @@ async fn handle_conversation(
         return Ok(());
     }
 
+    if !outbound_allowed(PLATFORM, &review_ids)? {
+        return Ok(());
+    }
     // 正文含求职者隐私，日志只留字数和理由
     match actions.send_text(page, &text) {
         Ok(true) => {
@@ -436,6 +473,9 @@ async fn handle_conversation(
     }
 
     if action == ReplyAction::ReplyAndSendResume {
+        if !outbound_allowed(PLATFORM, &review_ids)? {
+            return Ok(());
+        }
         if actions.send_resume(page)? {
             record_auto_send(
                 PLATFORM,

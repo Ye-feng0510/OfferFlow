@@ -9,6 +9,7 @@ import {
 const ALL_REASONS: ManualReviewReason[] = [
   "risk_keyword",
   "vet_rejected",
+  "model_escalation",
   "missing_job_id",
   "throttle_exhausted",
 ];

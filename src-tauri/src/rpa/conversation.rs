@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::output;
 use crate::config::{ReplayConfig, ReplayResourceType, ReplyResource, ReplyTemplate};
 use crate::dao::manual_review_dao::ReviewRequest;
-use crate::dao::model::{JobDetail, ManualReviewReason};
+use crate::dao::model::{JobDetail, ManualReviewReason, ManualReviewRecord};
 use crate::rpa::common::ChatMessage;
 use crate::rpa::run_flow::PlatformKind;
 
@@ -265,6 +265,39 @@ pub fn gate(context: &ConversationContext, limits: &ReplyLimits) -> GateVerdict 
     GateVerdict::Proceed
 }
 
+/// 人工挂起不能被一条普通追问解除；只有人工回复或节流额度恢复才消项。
+/// 缺失岗位标识也仍是人工待办，不能因为下一轮读到了标识就绕过它。
+pub fn review_can_resume(
+    held: &ManualReviewRecord,
+    messages: &[ChatMessage],
+    last_auto_sent_at: Option<i64>,
+    auto_replies_in_window: usize,
+    limits: &ReplyLimits,
+) -> bool {
+    let last_own = messages
+        .iter()
+        .filter(|message| !message.received)
+        .map(|message| message.time)
+        .max();
+    crate::dao::manual_review_dao::should_auto_resolve(held.updated_at, last_own, last_auto_sent_at)
+        || (held.reason == ManualReviewReason::ThrottleExhausted
+            && auto_replies_in_window < limits.max_auto_replies)
+}
+
+/// 模型的 Skip 是正常结束，Escalate 则必须落入持久人工挂起。
+pub fn decision_review(decision: &ReplyDecision) -> Option<(ManualReviewReason, String)> {
+    (decision.action == ReplyAction::Escalate).then(|| {
+        (
+            ManualReviewReason::ModelEscalation,
+            if decision.reason.trim().is_empty() {
+                "模型请求人工接手".to_string()
+            } else {
+                decision.reason.clone()
+            },
+        )
+    })
+}
+
 /// 待办条目里跟着会话走的那几个展示字段。
 ///
 /// 纯数据，构造过程不碰库：两个平台挂起会话时必须给出一样的字段口径、
@@ -425,10 +458,7 @@ pub enum ReplyRoute<'a> {
 /// 模板命中优先于模型：用户显式写了正则和话术，就说明这类消息他要的是
 /// 稳定可预期的答复，不该每次再花额度让模型重新发挥一遍。模板开关关掉时
 /// 存量模板一律不参与匹配，否则「关掉了却照发」比不关更难排查。
-pub fn choose_route<'a>(
-    config: &'a ReplayConfig,
-    context: &ConversationContext,
-) -> ReplyRoute<'a> {
+pub fn choose_route<'a>(config: &'a ReplayConfig, context: &ConversationContext) -> ReplyRoute<'a> {
     if config.enable_template_reply {
         if let Some(hit) = match_template(&config.templates, context) {
             return ReplyRoute::Template(hit);
@@ -627,7 +657,10 @@ mod tests {
 
     #[test]
     fn escalates_once_the_reply_budget_is_used_up() {
-        let verdict = gate(&context_with_window(vec![message(true, "还在吗")], 5), &limits());
+        let verdict = gate(
+            &context_with_window(vec![message(true, "还在吗")], 5),
+            &limits(),
+        );
 
         match verdict {
             GateVerdict::Escalate { reason, kind } => {
@@ -947,7 +980,10 @@ mod tests {
         let mut config = crate::config::default_app_config().replay_config;
         config.enable_llm = enable_llm;
         config.enable_template_reply = enable_template_reply;
-        config.templates = vec![template("面试", vec![text_resource("好的，时间我这边可以")])];
+        config.templates = vec![template(
+            "面试",
+            vec![text_resource("好的，时间我这边可以")],
+        )];
         config
     }
 
