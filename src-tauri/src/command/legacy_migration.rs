@@ -94,12 +94,12 @@ fn checked_exists(path: &Path) -> Result<bool, AppError> {
         current.push(part.as_os_str());
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
-                let mut linked = metadata.file_type().is_symlink();
+                let linked = metadata.file_type().is_symlink();
                 #[cfg(windows)]
-                {
+                let linked = {
                     use std::os::windows::fs::MetadataExt;
-                    linked |= metadata.file_attributes() & 0x400 != 0;
-                }
+                    linked || metadata.file_attributes() & 0x400 != 0
+                };
                 if linked {
                     return Err(failure("迁移路径包含符号链接或重解析点，已拒绝导入"));
                 }
