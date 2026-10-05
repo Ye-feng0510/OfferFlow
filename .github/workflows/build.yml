@@ -6,9 +6,13 @@ on:
   pull_request:
     branches: [master]
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -27,8 +31,22 @@ jobs:
       - name: Run frontend tests
         run: pnpm test:run
 
+      - name: Typecheck frontend
+        run: pnpm exec tsc --noEmit
+
+      - name: Run script tests
+        run: node --test scripts/*.node-test.mjs
+
+      - name: Check network boundary
+        run: pnpm check:network
+
+      - name: Build frontend
+        run: pnpm build
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Install Linux system dependencies (Tauri)
         run: |
@@ -44,8 +62,35 @@ jobs:
 
       - name: Cargo check (Rust)
         working-directory: src-tauri
-        run: cargo check
+        run: cargo check --locked
+
+      - name: Clippy (Rust)
+        working-directory: src-tauri
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Cargo test (Rust)
         working-directory: src-tauri
-        run: cargo test
+        run: cargo test --locked
+
+  windows-rust:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cargo check (Rust)
+        working-directory: src-tauri
+        run: cargo check --locked
+
+      - name: Clippy (Rust)
+        working-directory: src-tauri
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Cargo test (Rust)
+        working-directory: src-tauri
+        run: cargo test --locked
