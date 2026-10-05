@@ -264,7 +264,7 @@ test("enable disabled send button after input event", async () => {
   );
 });
 
-test("retry at most once when no send-push arrives and message stays present", async () => {
+test("click only once when no send-push arrives and message stays present", async () => {
   const document = makeDocument(`
     <div class="im-ui-msg-list-content">
       <textarea></textarea>
@@ -273,15 +273,103 @@ test("retry at most once when no send-push arrives and message stays present", a
   `);
   const { sleep } = makeSleepTracker();
   const requestRecords = [];
+  let clicks = 0;
+  document.querySelector(".ant-im-btn").addEventListener("click", () => {
+    clicks++;
+  });
 
   const result = await runLiepinSend(document, {
     message: "你好",
     requestRecords,
     sleep,
+    proofTimeoutMs: 300,
   });
 
-  assert.equal(result.attempts, 2);
-  assert.equal(result.retried, true);
+  assert.equal(clicks, 1);
+  assert.equal(document.querySelector("textarea").value, "你好");
+  assert.equal(result.attempts, 1);
+  assert.equal(result.retried, false);
+  assert.equal(result.success, false);
+  assert.equal(result.requestSeen, false);
+  assert.equal(result.requestSucceeded, false);
+  assert.equal(result.bubbleSeen, false);
+  assert.equal(result.inputCleared, false);
+  assert.equal(result.reason, "no-signal");
+});
+
+for (const responseAfterSleeps of [1, 2]) {
+  test(`click only once with input present and response after ${responseAfterSleeps} observation sleeps`, async () => {
+    const document = makeDocument(`
+      <div class="im-ui-msg-list-content">
+        <textarea></textarea>
+        <button class="ant-im-btn">发送</button>
+      </div>
+    `);
+    const requestRecords = [];
+    let clicks = 0;
+    let sleeps = 0;
+    document.querySelector(".ant-im-btn").addEventListener("click", () => {
+      clicks++;
+    });
+    const result = await runLiepinSend(document, {
+      message: "你好",
+      requestRecords,
+      proofTimeoutMs: 300,
+      sleep: async () => {
+        sleeps++;
+        if (sleeps === responseAfterSleeps) {
+          requestRecords.push({
+            url: "https://api-c.liepin.com/api/com.liepin.im.c.chat.send-push",
+            status: 200,
+          });
+        }
+      },
+    });
+
+    const observedBeforeTimeout = responseAfterSleeps === 1;
+    assert.equal(requestRecords.length, 1);
+    assert.equal(clicks, 1);
+    assert.equal(document.querySelector("textarea").value, "你好");
+    assert.equal(result.attempts, 1);
+    assert.equal(result.retried, false);
+    assert.equal(result.success, observedBeforeTimeout);
+    assert.equal(result.requestSeen, observedBeforeTimeout);
+    assert.equal(result.requestSucceeded, observedBeforeTimeout);
+    assert.equal(result.bubbleSeen, false);
+    assert.equal(result.inputCleared, false);
+    assert.equal(result.reason, observedBeforeTimeout ? "send-request" : "no-signal");
+  });
+}
+
+test("a new matching bubble still succeeds after exactly one click", async () => {
+  const document = makeDocument(`
+    <div class="im-ui-msg-list-content">
+      <textarea></textarea>
+      <button class="ant-im-btn">发送</button>
+    </div>
+  `);
+  let clicks = 0;
+  document.querySelector(".ant-im-btn").addEventListener("click", () => {
+    clicks++;
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.textContent = "你好";
+    document.querySelector(".im-ui-msg-list-content").append(bubble);
+  });
+
+  const result = await runLiepinSend(document, {
+    message: "你好",
+    requestRecords: [],
+    sleep: async () => {},
+  });
+
+  assert.equal(clicks, 1);
+  assert.equal(result.attempts, 1);
+  assert.equal(result.retried, false);
+  assert.equal(result.success, true);
+  assert.equal(result.requestSucceeded, false);
+  assert.equal(result.bubbleSeen, true);
+  assert.equal(result.reason, "bubble");
 });
 
 test("do not retry when send-push or a new bubble is observed", async () => {
@@ -341,8 +429,8 @@ test("do not treat a pre-existing identical bubble as a new send", async () => {
   });
 
   assert.equal(result.success, false);
-  assert.equal(result.attempts, 2);
-  assert.equal(result.retried, true);
+  assert.equal(result.attempts, 1);
+  assert.equal(result.retried, false);
 });
 
 test("replace a stale draft instead of appending it to the new message", async () => {

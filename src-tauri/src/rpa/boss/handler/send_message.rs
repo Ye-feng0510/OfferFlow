@@ -89,10 +89,7 @@ pub fn send_image(page: &Page, image_path: &Path) -> Result<bool, anyhow::Error>
 
 /// 给定回复列表资源 依次执行
 pub fn send_messages(page: &Page, resources: Vec<ReplyResource>) -> Result<bool, anyhow::Error> {
-    for resource in resources {
-        if resource.content.trim().is_empty() {
-            continue;
-        }
+    send_resources_with(resources, |resource| {
         let sent = match resource.resource_type {
             ReplayResourceType::Text | ReplayResourceType::LLM => {
                 send_text_message(page, &resource.content)?
@@ -103,19 +100,80 @@ pub fn send_messages(page: &Page, resources: Vec<ReplyResource>) -> Result<bool,
                 res
             }
         };
-
         if !sent {
             logger::warning(format!("发送消息失败:{:?}", resource.resource_type))?;
+        } else {
+            sleep_random_ms(500, 1000);
+        }
+        Ok(sent)
+    })
+}
+
+fn send_resources_with(
+    resources: Vec<ReplyResource>,
+    mut send: impl FnMut(&ReplyResource) -> Result<bool, anyhow::Error>,
+) -> Result<bool, anyhow::Error> {
+    let mut sent_any = false;
+    for resource in resources {
+        if resource.content.trim().is_empty() {
+            continue;
+        }
+        if !send(&resource)? {
             return Ok(false);
         }
-
-        sleep_random_ms(500, 1000);
+        sent_any = true;
     }
 
-    Ok(true)
+    Ok(sent_any)
 }
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn all_resources_are_sent_in_configured_order() {
+        let resources = [
+            (ReplayResourceType::Text, "custom greeting"),
+            (ReplayResourceType::LLM, "generated greeting"),
+            (ReplayResourceType::Image, "resume.png"),
+            (ReplayResourceType::Text, "closing"),
+        ].into_iter().map(|(resource_type, content)| ReplyResource {
+            resource_type, content: content.into(),
+        }).collect();
+        let mut calls = Vec::new();
+        assert!(send_resources_with(resources, |resource| {
+            calls.push(resource.content.clone());
+            Ok(true)
+        }).unwrap());
+        assert_eq!(calls, ["custom greeting", "generated greeting", "resume.png", "closing"]);
+    }
+
+    #[test]
+    fn empty_and_blank_llm_sequences_are_not_successful() {
+        for resources in [vec![], vec![ReplyResource {
+            resource_type: ReplayResourceType::LLM,
+            content: " \n ".into(),
+        }], vec![ReplyResource {
+            resource_type: ReplayResourceType::Text,
+            content: " \t ".into(),
+        }]] {
+            assert!(!send_resources_with(resources, |_| panic!("no send expected")).unwrap());
+        }
+    }
+
+    #[test]
+    fn partial_send_is_not_whole_sequence_success() {
+        let resources = ["first", "fails", "not reached"].into_iter().map(|content| ReplyResource {
+            resource_type: ReplayResourceType::Text, content: content.into(),
+        }).collect();
+        let mut calls = Vec::new();
+        assert!(!send_resources_with(resources, |resource| {
+            calls.push(resource.content.clone());
+            Ok(resource.content != "fails")
+        }).unwrap());
+        assert_eq!(calls, ["first", "fails"]);
+    }
+
     #[test]
     fn send_message_module_has_no_async_llm_send_path() {
         let source = include_str!("send_message.rs");

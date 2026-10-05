@@ -699,7 +699,9 @@ async fn greet_job(
                     logger::info("猎聘已点击投简历入口，继续发送招呼消息")?;
                 }
                 sleep_random_ms(800, 1200);
-                send_resources(&page, resources)?;
+                if !send_resources(&page, resources)? {
+                    return Ok(false);
+                }
                 let resume_sent = confirm_resume_delivery(&page)?;
                 if !resume_sent {
                     logger::warning("猎聘消息已发送，但尚未确认简历投递，保留简历未投递状态")?;
@@ -718,11 +720,10 @@ async fn greet_job(
     }
     let close_result = page.close();
 
-    match (result, close_result) {
-        (Ok(sent), Ok(())) => Ok(sent),
-        (Err(err), _) => Err(err),
-        (Ok(_), Err(err)) => Err(err.into()),
+    if let Err(error) = close_result {
+        let _ = logger::warning(format!("猎聘关闭详情页失败，保留发送结果：{error}"));
     }
+    result
 }
 
 fn greet_failure_message(title: &str, company_name: &str, error: &anyhow::Error) -> String {
@@ -735,26 +736,36 @@ fn greet_failure_message(title: &str, company_name: &str, error: &anyhow::Error)
 pub(crate) fn send_resources(
     page: &Page,
     resources: Vec<ReplyResource>,
-) -> Result<(), anyhow::Error> {
+) -> Result<bool, anyhow::Error> {
+    send_resources_with(resources, |resource| match resource.resource_type {
+        ReplayResourceType::Text | ReplayResourceType::LLM => {
+            send_text_resource(page, &resource.content)
+        }
+        ReplayResourceType::Image => send_image_resource(page, &resource.content),
+    })
+}
+
+fn send_resources_with(
+    resources: Vec<ReplyResource>,
+    mut send: impl FnMut(&ReplyResource) -> Result<(), anyhow::Error>,
+) -> Result<bool, anyhow::Error> {
+    let mut sent_any = false;
     for resource in resources {
         if resource.content.trim().is_empty() {
             continue;
         }
 
-        match resource.resource_type {
-            ReplayResourceType::Text | ReplayResourceType::LLM => {
-                send_text_resource(page, &resource.content)?;
-            }
+        match send(&resource) {
+            Ok(()) => sent_any = true,
             // 图片属于附加内容，失败只告警不中断，避免因一张图让整个岗位打招呼判失败
-            ReplayResourceType::Image => {
-                if let Err(error) = send_image_resource(page, &resource.content) {
-                    logger::warning(format!("猎聘图片发送失败，已跳过该条：{}", error))?;
-                }
+            Err(error) if resource.resource_type == ReplayResourceType::Image => {
+                let _ = logger::warning(format!("猎聘图片发送失败，已跳过该条：{}", error));
             }
+            Err(error) => return Err(error),
         }
     }
 
-    Ok(())
+    Ok(sent_any)
 }
 
 /// 猎聘聊天窗的上传控件是 rc-upload（`ant-im-upload`），
@@ -1326,6 +1337,39 @@ fn non_empty(value: String) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::default_app_config;
+
+    #[test]
+    fn resource_sequence_preserves_best_effort_images_and_all_text() {
+        let resources = [
+            (ReplayResourceType::Text, "custom"),
+            (ReplayResourceType::Image, "missing.png"),
+            (ReplayResourceType::LLM, "generated"),
+            (ReplayResourceType::Image, "resume.png"),
+        ].into_iter().map(|(resource_type, content)| ReplyResource {
+            resource_type, content: content.into(),
+        }).collect();
+        let mut calls = Vec::new();
+        assert!(send_resources_with(resources, |resource| {
+            calls.push(resource.content.clone());
+            if resource.content == "missing.png" {
+                Err(anyhow::anyhow!("image failed"))
+            } else {
+                Ok(())
+            }
+        }).unwrap());
+        assert_eq!(calls, ["custom", "missing.png", "generated", "resume.png"]);
+    }
+
+    #[test]
+    fn empty_blank_and_failed_image_only_are_not_success() {
+        assert!(!send_resources_with(vec![], |_| panic!("no send")).unwrap());
+        assert!(!send_resources_with(vec![ReplyResource {
+            resource_type: ReplayResourceType::LLM, content: " \n".into(),
+        }], |_| panic!("no send")).unwrap());
+        assert!(!send_resources_with(vec![ReplyResource {
+            resource_type: ReplayResourceType::Image, content: "missing.png".into(),
+        }], |_| Err(anyhow::anyhow!("image failed"))).unwrap());
+    }
 
     #[test]
     fn build_job_search_url_uses_liepin_search_results_page() {

@@ -79,9 +79,7 @@ impl ConversationActions for LiepinActions {
                 resource_type: ReplayResourceType::Text,
                 content: text.to_string(),
             }],
-        )?;
-
-        Ok(true)
+        )
     }
 
     /// 猎聘候选人端没有主动投递简历的入口，所以这里恒为 false。

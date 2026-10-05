@@ -196,8 +196,18 @@ pub async fn position_say_hello_on_page(
                 AnalysisTrigger::FilterPassed,
                 &app_runtime_config,
             );
-            match handle_greet(connection, greet_job.clone(), app_runtime_config.clone()).await {
-                Ok(()) => consecutive_greet_failures = 0,
+            let greeted = match handle_greet(connection, greet_job.clone(), app_runtime_config.clone()).await {
+                Ok(true) => {
+                    consecutive_greet_failures = 0;
+                    true
+                }
+                Ok(false) => {
+                    consecutive_greet_failures = 0;
+                    if !pacer.after_greet(false).await {
+                        break 'outer StopReason::UserStopped;
+                    }
+                    continue;
+                }
                 Err(error) => {
                     stats.greet_failed += 1;
                     consecutive_greet_failures += 1;
@@ -213,14 +223,13 @@ pub async fn position_say_hello_on_page(
                     // 这里仅作为“单次失败即终止”策略的兜底出口
                     break 'outer StopReason::GreetFailureAborted;
                 }
-            }
+            };
+
+            stats.record_greet_success(greeted, &mut processed_job_ids, &greet_job.platform_job_id);
+            logger::info(format!("{} 初次沟通成功", greet_job.title))?;
             if is_job_task_stop_requested() {
                 break 'outer StopReason::UserStopped;
             }
-
-            stats.greet_success += 1;
-            logger::info(format!("{} 初次沟通成功", greet_job.title))?;
-            processed_job_ids.insert(greet_job.platform_job_id.clone());
             // 停顿、以及连投若干条之后的休息都在这里面。收到停止请求时立即收尾，
             // 不能让用户等完一段十几分钟的休息
             if !pacer.after_greet(true).await {
@@ -361,6 +370,13 @@ struct RoundStats {
 }
 
 impl RoundStats {
+    fn record_greet_success(&mut self, sent: bool, processed: &mut HashSet<String>, job_id: &str) {
+        if sent {
+            self.greet_success += 1;
+            processed.insert(job_id.to_string());
+        }
+    }
+
     fn record_skip(&mut self, reason: SkipReason) {
         match reason {
             SkipReason::AlreadyViewed => self.skipped_viewed += 1,
@@ -1338,23 +1354,50 @@ async fn handle_greet(
     browser_page: &ChromiumPage,
     greet_job: GreetJob,
     config: AppRuntimeConfig,
-) -> Result<(), anyhow::Error> {
-    // 工作标签直接打开已知岗位详情，避免重新定位列表中的分页卡片。
-    let work_page = browser::new_stealth_tab(browser_page)?;
-    let result = async {
-        work_page.goto(work_tab_navigation_url(&greet_job))?;
-        work_page.wait(GREET_BUTTON_SELECTOR, Duration::from_secs(30))?;
-        sleep_random_ms(500, 800);
-        handle_greet_on_work_tab(browser_page, &work_page, greet_job, config).await
-    }
-    .await;
-    let close_result = work_page.close();
+) -> Result<bool, anyhow::Error> {
+    prepare_then_contact(build_greet_resources(&config, &greet_job), |resources| async {
+        // 工作标签直接打开已知岗位详情，避免重新定位列表中的分页卡片。
+        let work_page = browser::new_stealth_tab(browser_page)?;
+        let result = async {
+            work_page.goto(work_tab_navigation_url(&greet_job))?;
+            work_page.wait(GREET_BUTTON_SELECTOR, Duration::from_secs(30))?;
+            sleep_random_ms(500, 800);
+            handle_greet_on_work_tab(
+                browser_page, &work_page, greet_job.clone(), config.clone(), resources,
+            ).await
+        }
+        .await;
+        let close_result = work_page.close();
 
-    match (result, close_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), _) => Err(error),
-        (Ok(()), Err(error)) => Err(error.into()),
+        preserve_greet_result(result, close_result.map_err(Into::into))
+    })
+    .await
+}
+
+async fn prepare_then_contact<P, C, F>(prepare: P, contact: C) -> Result<bool, anyhow::Error>
+where
+    P: std::future::Future<Output = Result<SendVerdict, anyhow::Error>>,
+    C: FnOnce(Vec<ReplyResource>) -> F,
+    F: std::future::Future<Output = Result<bool, anyhow::Error>>,
+{
+    match prepare.await? {
+        SendVerdict::Hold(reason) => {
+            let _ = logger::info(format!("跳过打招呼，未建联：{reason}"));
+            Ok(false)
+        }
+        SendVerdict::Send(resources) if resources.is_empty() => Ok(false),
+        SendVerdict::Send(resources) => contact(resources).await,
     }
+}
+
+fn preserve_greet_result(
+    result: Result<bool, anyhow::Error>,
+    cleanup: Result<(), anyhow::Error>,
+) -> Result<bool, anyhow::Error> {
+    if let Err(error) = cleanup {
+        let _ = logger::warning(format!("关闭打招呼标签失败，保留发送结果：{error}"));
+    }
+    result
 }
 
 fn work_tab_navigation_url(greet_job: &GreetJob) -> &str {
@@ -1366,7 +1409,8 @@ async fn handle_greet_on_work_tab(
     work_page: &Page,
     greet_job: GreetJob,
     config: AppRuntimeConfig,
-) -> Result<(), anyhow::Error> {
+    resources: Vec<ReplyResource>,
+) -> Result<bool, anyhow::Error> {
     // 1. 在工作标签的岗位详情页中等待并匹配沟通按钮
     let mut current_job_ready = false;
     let mut target_btn = None;
@@ -1402,14 +1446,17 @@ async fn handle_greet_on_work_tab(
         .unwrap_or(false);
     if data_isfriend {
         logger::info("岗位已打过招呼 跳过")?;
-        return Ok(());
+        return Ok(false);
     }
 
     // 2. BOSS 的建联按钮使用站内 JavaScript 路由，会将当前工作标签切换到聊天页。
+    if is_job_task_stop_requested() {
+        return Ok(false);
+    }
     human_input::click(work_page, &btn)?;
     if is_job_task_stop_requested() {
         logger::info("求职任务已结束")?;
-        return Ok(());
+        return Ok(false);
     }
 
     // 3. 在岗位详情页处理确认弹窗（例如“继续沟通”、“确定”、“好”）
@@ -1419,14 +1466,14 @@ async fn handle_greet_on_work_tab(
     for _ in 0..15 {
         if is_job_task_stop_requested() {
             logger::info("求职任务已结束")?;
-            return Ok(());
+            return Ok(false);
         }
 
         // BOSS 可能直接将当前工作标签导航到聊天页，并不会给出二次确认
         // 弹窗或带岗位 ID 的 URL。这是可用的建联成功信号。
         if is_chat_page_url(&work_page.url()?) {
             logger::info("工作标签已进入聊天页，正在发送招呼")?;
-            return handle_send_message_on_chat_page(work_page, greet_job, config).await;
+            return handle_send_message_on_chat_page(work_page, greet_job, config, resources).await;
         }
 
         if let Ok(Some(dialog_title)) = work_page.ele(".greet-boss-dialog h3") {
@@ -1498,14 +1545,13 @@ async fn handle_greet_on_work_tab(
 
     if is_job_task_stop_requested() {
         logger::info("求职任务已结束")?;
-        return Ok(());
+        return Ok(false);
     }
 
-    // 已显示成功提示但站点没有跳转聊天页时，默认招呼已经真实发出；不能误判为失败。
-    if greet_success_seen {
-        logger::info("站点已确认向 BOSS 发送消息，未跳转聊天页，当前岗位视为建联成功")?;
-        save_job_detail(&greet_job.platform_job_id, &greet_job, &config);
-        return Ok(());
+    // 站点默认招呼不代表用户配置的完整发送序列已执行；有聊天地址仍继续发送。
+    if greet_success_seen && chat_redirect_url.is_none() {
+        logger::warning("站点提示已发送默认消息，但没有聊天地址，未完成自定义招呼序列")?;
+        return Ok(false);
     }
 
     // 4. 当前页未自动进入聊天时，使用按钮真实提供的聊天地址打开新 Tab。
@@ -1526,25 +1572,24 @@ async fn handle_greet_on_work_tab(
     };
 
     let page = browser::new_stealth_tab(browser_page)?;
-    page.goto(&chat_url)?;
-    let result = handle_send_message_on_chat_page(&page, greet_job, config).await;
+    let result = async {
+        page.goto(&chat_url)?;
+        handle_send_message_on_chat_page(&page, greet_job, config, resources).await
+    }.await;
     let close_result = page.close();
 
-    match (result, close_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), _) => Err(error),
-        (Ok(()), Err(error)) => Err(error.into()),
-    }
+    preserve_greet_result(result, close_result.map_err(Into::into))
 }
 
 async fn handle_send_message_on_chat_page(
     page: &Page,
     greet_job: GreetJob,
     config: AppRuntimeConfig,
-) -> Result<(), anyhow::Error> {
+    resources: Vec<ReplyResource>,
+) -> Result<bool, anyhow::Error> {
     if is_job_task_stop_requested() {
         logger::info("求职任务已结束")?;
-        return Ok(());
+        return Ok(false);
     }
 
     // 等待聊天输入区与发送按钮加载完成
@@ -1553,28 +1598,25 @@ async fn handle_send_message_on_chat_page(
     page.wait(".chat-op .btn-send", Duration::from_secs(15))
         .map_err(|error| chat_wait_error(page, error))?;
 
-    // 构建招呼资源：优先 LLM 生成，否则使用默认模板
-    match build_greet_resources(&config, &greet_job).await? {
-        // 整轮取消：既不发文本也不发图片，也不记为已沟通——我们并没有联系过对方
-        SendVerdict::Hold(reason) => {
-            logger::info(format!(
-                "跳过 {}，未发送任何内容：{reason}",
-                greet_job.title
-            ))?;
-            return Ok(());
-        }
-        SendVerdict::Send(resources) => {
-            send_if_any(resources, |resources| send_messages(page, resources))?;
-        }
+    finish_greet(
+        send_if_any(resources, |resources| send_messages(page, resources)),
+        || {
+            let saved = save_job_detail(&greet_job.platform_job_id, &greet_job, &config);
+            auto_analysis::schedule(&saved, AnalysisTrigger::GreetSent, &config);
+            sleep_random_ms(1200, 2000);
+        },
+    )
+}
+
+fn finish_greet(
+    result: Result<bool, anyhow::Error>,
+    on_success: impl FnOnce(),
+) -> Result<bool, anyhow::Error> {
+    let sent = result?;
+    if sent {
+        on_success();
     }
-
-    // 保存该岗位至本地数据库
-    let saved = save_job_detail(&greet_job.platform_job_id, &greet_job, &config);
-    auto_analysis::schedule(&saved, AnalysisTrigger::GreetSent, &config);
-
-    sleep_random_ms(1200, 2000);
-
-    Ok(())
+    Ok(sent)
 }
 
 fn send_if_any<F>(resources: Vec<ReplyResource>, send: F) -> Result<bool, anyhow::Error>
@@ -1681,6 +1723,69 @@ const html = document.documentElement;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn preparation_precedes_contact_and_preserves_all_resources() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let sent = prepare_then_contact(async {
+            events.borrow_mut().push("prepare");
+            Ok(SendVerdict::Send(vec![
+                ReplyResource { resource_type: crate::config::ReplayResourceType::Text, content: "custom".into() },
+                ReplyResource { resource_type: crate::config::ReplayResourceType::Image, content: "resume.png".into() },
+            ]))
+        }, |resources| {
+            events.borrow_mut().push("contact");
+            async move {
+            assert_eq!(resources.iter().map(|r| r.content.as_str()).collect::<Vec<_>>(), ["custom", "resume.png"]);
+            Ok(true)
+            }
+        }).await.unwrap();
+        assert!(sent);
+        assert_eq!(*events.borrow(), ["prepare", "contact"]);
+    }
+
+    #[tokio::test]
+    async fn held_empty_and_failed_preparation_never_contact() {
+        for verdict in [
+            Ok(SendVerdict::Hold("skip".into())),
+            Ok(SendVerdict::Send(vec![])),
+            Err(anyhow::anyhow!("prepare failed")),
+        ] {
+            let result = prepare_then_contact(async { verdict }, |_| async {
+                panic!("contact must not run")
+            }).await;
+            assert!(!matches!(result, Ok(true)));
+        }
+    }
+
+    #[test]
+    fn only_complete_send_runs_persistence_analysis_and_success_accounting() {
+        for result in [Ok(true), Ok(false), Err(anyhow::anyhow!("send failed"))] {
+            let expected = matches!(result, Ok(true));
+            let mut saved = 0;
+            let mut analyzed = 0;
+            let mut stats = RoundStats::default();
+            let mut processed = HashSet::new();
+            let result = finish_greet(result, || {
+                saved += 1;
+                analyzed += 1;
+            });
+            stats.record_greet_success(result.unwrap_or(false), &mut processed, "job");
+            assert_eq!(saved, usize::from(expected));
+            assert_eq!(analyzed, usize::from(expected));
+            assert_eq!(stats.greet_success, u32::from(expected));
+            assert_eq!(processed.contains("job"), expected);
+        }
+    }
+
+    #[test]
+    fn cleanup_preserves_sent_skipped_and_failed_action_results() {
+        for sent in [true, false] {
+            assert_eq!(preserve_greet_result(Ok(sent), Err(anyhow::anyhow!("close failed"))).unwrap(), sent);
+        }
+        let error = preserve_greet_result(Err(anyhow::anyhow!("send failed")), Err(anyhow::anyhow!("close failed"))).unwrap_err();
+        assert_eq!(error.to_string(), "send failed");
+    }
 
     #[test]
     fn chat_redirect_does_not_require_the_current_job_id() {

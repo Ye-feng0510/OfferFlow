@@ -389,17 +389,17 @@ async function runLiepinSend(document, {
   }
   result.popupClosed = modalState.closed;
 
-  let container = findChatContainer(document);
+  const container = findChatContainer(document);
   if (!container) {
     return { ...result, reason: "chat-container-missing" };
   }
 
-  let input = await waitFor(() => findChatInput(container), inputTimeoutMs, wait);
+  const input = await waitFor(() => findChatInput(container), inputTimeoutMs, wait);
   if (!input) {
     return { ...result, reason: "chat-input-missing" };
   }
 
-  let firstAttempt = await clickSendOnce({
+  const firstAttempt = await clickSendOnce({
     container,
     input,
     message: text,
@@ -416,63 +416,11 @@ async function runLiepinSend(document, {
   result.bubbleSeen = firstAttempt.bubbleSeen;
   result.inputCleared = firstAttempt.inputCleared;
 
-  if (firstAttempt.requestSucceeded || firstAttempt.bubbleSeen) {
-    return {
-      ...result,
-      success: firstAttempt.requestSucceeded || firstAttempt.bubbleSeen,
-      reason: firstAttempt.reason,
-    };
-  }
-
-  if (firstAttempt.requestSeen || firstAttempt.bubbleSeen || firstAttempt.inputCleared || !firstAttempt.messageStillPresent) {
-    return {
-      ...result,
-      success: false,
-      reason: firstAttempt.reason,
-    };
-  }
-
-  const retryModalState = await handleKnownModal(document, wait);
-  if (retryModalState.blocked) {
-    return {
-      ...result,
-      attempts: 1,
-      blockedModal: true,
-      reason: retryModalState.reason,
-    };
-  }
-
-  result.popupClosed = result.popupClosed || retryModalState.closed;
-
-  container = findChatContainer(document) || container;
-  input = findChatInput(container) || input;
-
-  const secondAttempt = await clickSendOnce({
-    container,
-    input,
-    message: text,
-    requestRecords: records,
-    requestSince,
-    sleep: wait,
-    buttonTimeoutMs,
-    proofTimeoutMs,
-    initialBubbleCount: matchingBubbleCount(container, text),
-  });
-
+  // Missing proof does not establish that the first click failed to send.
   return {
     ...result,
-    attempts: 2,
-    retried: true,
-    requestSeen: result.requestSeen || secondAttempt.requestSeen,
-    requestSucceeded: result.requestSucceeded || secondAttempt.requestSucceeded,
-    bubbleSeen: result.bubbleSeen || secondAttempt.bubbleSeen,
-    inputCleared: result.inputCleared || secondAttempt.inputCleared,
-    success:
-      result.requestSucceeded
-      || secondAttempt.requestSucceeded
-      || result.bubbleSeen
-      || secondAttempt.bubbleSeen,
-    reason: secondAttempt.reason,
+    success: firstAttempt.requestSucceeded || firstAttempt.bubbleSeen,
+    reason: firstAttempt.reason,
   };
 }
 

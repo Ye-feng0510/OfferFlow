@@ -7,7 +7,7 @@ use serde::Deserialize;
 use crate::{
     agent::{tasks::ReplyDecisionTask, AgentRunner},
     auto_analysis, browser,
-    config::{AnalysisTrigger, AppRuntimeConfig},
+    config::{AnalysisTrigger, AppRuntimeConfig, ReplyResource},
     dao::{
         auto_reply_log_dao, chat_message_dao, job_detail_dao,
         model::{AutoReplyAction, JobDetail, ManualReviewReason},
@@ -348,18 +348,22 @@ async fn handle_conversation(
 
             // 固定话术不过发送前体检：那是给模型生成内容做的体检，
             // 拿它去截断或否决用户的原话，只会让"固定回复"变得不固定
-            for resource in hit.resources {
+            let (sent_count, send_result) = send_template_resources(hit.resources, |resource| {
                 if !outbound_allowed(PLATFORM, &review_ids)? {
-                    return Ok(());
+                    return Ok(None);
                 }
-                if let Err(error) = send_resources(page, vec![resource]) {
-                    logger::warning(format!("猎聘模板回复发送失败，跳过该会话：{}", error))?;
-                    return Ok(());
-                }
+                send_resources(page, vec![resource]).map(Some)
+            });
+            if let Err(error) = send_result {
+                logger::warning(format!("猎聘模板回复发送失败，跳过剩余资源：{}", error))?;
+            }
+            if sent_count == 0 {
+                logger::warning(format!("猎聘命中回复规则「{}」，没有资源发送成功", rule))?;
+                return Ok(());
             }
             logger::info(format!(
-                "猎聘命中回复规则「{}」，已发送 {} 条资源",
-                rule, count
+                "猎聘命中回复规则「{}」，已发送 {}/{} 条资源",
+                rule, sent_count, count
             ))?;
             record_auto_send(
                 PLATFORM,
@@ -500,6 +504,22 @@ fn job_id_of(context: &ConversationContext) -> &str {
         .as_ref()
         .map(|job| job.id.as_str())
         .unwrap_or_default()
+}
+
+fn send_template_resources(
+    resources: Vec<ReplyResource>,
+    mut send: impl FnMut(ReplyResource) -> Result<Option<bool>, anyhow::Error>,
+) -> (usize, Result<(), anyhow::Error>) {
+    let mut sent_count = 0;
+    for resource in resources {
+        match send(resource) {
+            Ok(Some(true)) => sent_count += 1,
+            Ok(Some(false)) => {}
+            Ok(None) => break,
+            Err(error) => return (sent_count, Err(error)),
+        }
+    }
+    (sent_count, Ok(()))
 }
 
 fn action_label(action: ReplyAction) -> &'static str {
@@ -1047,6 +1067,61 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
 mod tests {
     use super::*;
     use crate::config::{ReplayResourceType, ReplyResource, ReplyTemplate};
+
+    #[test]
+    fn failed_template_image_does_not_prevent_later_text() {
+        let resources = vec![
+            ReplyResource { resource_type: ReplayResourceType::Image, content: "missing.png".into() },
+            ReplyResource { resource_type: ReplayResourceType::Text, content: "hello".into() },
+        ];
+        let mut calls = Vec::new();
+        let (sent_count, result) = send_template_resources(resources, |resource| {
+            calls.push(resource.content);
+            Ok(Some(resource.resource_type == ReplayResourceType::Text))
+        });
+        result.unwrap();
+        assert_eq!(calls, ["missing.png", "hello"]);
+        assert_eq!(sent_count, 1);
+    }
+
+    #[test]
+    fn all_failed_template_resources_have_no_success_to_record() {
+        let resources = ["first.png", "second.png"].into_iter().map(|content| ReplyResource {
+            resource_type: ReplayResourceType::Image, content: content.into(),
+        }).collect();
+        let mut attempts = 0;
+        let (sent_count, result) = send_template_resources(resources, |_| {
+            attempts += 1;
+            Ok(Some(false))
+        });
+        result.unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(sent_count, 0);
+    }
+
+    #[test]
+    fn template_error_or_hold_preserves_only_prior_success_count() {
+        for fail in [false, true] {
+            let resources = ["first", "stop", "not reached"].into_iter().map(|content| ReplyResource {
+                resource_type: ReplayResourceType::Text, content: content.into(),
+            }).collect();
+            let mut attempts = 0;
+            let (sent_count, result) = send_template_resources(resources, |_| {
+                attempts += 1;
+                if attempts == 1 {
+                    Ok(Some(true))
+                } else if fail {
+                    Err(anyhow::anyhow!("send failed"))
+                } else {
+                    Ok(None)
+                }
+            });
+            assert_eq!(attempts, 2);
+            assert_eq!(sent_count, 1);
+            assert_eq!(result.is_err(), fail);
+        }
+    }
+
 
     fn job(id: &str, title: &str) -> JobDetail {
         JobDetail {
